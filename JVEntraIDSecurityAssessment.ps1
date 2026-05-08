@@ -15,6 +15,10 @@
         .\JVEntraIDSecurityAssessment.ps1 -OutputPath .\JVEntraIDSecurityAssessment.html -OpenReport
 
     By default, this script uses classic browser sign-in through Microsoft.Graph.Authentication 2.33.0.
+    v2.4: Added -HighPrivilegedOnly. Default behavior remains a full scan/report. With this switch,
+          report rows are limited to users, groups, service principals and CA policies with privileged/security-relevant signals.
+    v2.3: Service principals without a user owner are no longer reported as findings or KPI cards.
+          Owner information remains visible in the Service Principals tab.
     v2.2: English report/UI, Findings tab moved to the end, Scan warnings tab removed, footer links to GitHub,
           non-informative unknown API permission placeholders are filtered, and higher-risk permissions are sorted first.
     v2.1: More robust user detail and service principal processing; fixed owner format-operator bug.
@@ -61,6 +65,8 @@ param(
     [switch]$UseLegacyGraphAuthModule,
 
     [switch]$SkipCAGroupMemberExpansion,
+
+    [switch]$HighPrivilegedOnly,
 
     [switch]$OpenReport,
 
@@ -995,6 +1001,23 @@ function Sort-PermissionLabels {
     return @($clean | Sort-Object @{ Expression = { Get-PermissionRiskWeight -PermissionLabel $_ }; Descending = $true }, @{ Expression = { $_ }; Ascending = $true } -Unique)
 }
 
+function Get-HighPrivilegePermissionLabels {
+    param([AllowNull()] [object]$PermissionLabels)
+
+    $highPrivilegeLabels = New-Object System.Collections.ArrayList
+    foreach ($label in @(ConvertTo-SafeArray -Value $PermissionLabels)) {
+        if (Test-EmptyPermissionLabel -PermissionLabel $label) {
+            continue
+        }
+
+        if ((Get-PermissionRiskWeight -PermissionLabel $label) -ge 60) {
+            [void]$highPrivilegeLabels.Add([string]$label)
+        }
+    }
+
+    return @(Sort-PermissionLabels -PermissionLabels $highPrivilegeLabels)
+}
+
 function Get-ConditionalAccessExpandedExcludedUsers {
     param(
         [AllowNull()] [object]$ExcludeUsers,
@@ -1366,6 +1389,9 @@ $context = Get-MgContext
 $contextTenantId = Get-ObjectProperty -InputObject $context -Name "TenantId"
 $contextAccount = Get-ObjectProperty -InputObject $context -Name "Account"
 Write-ScanLog "Connected to tenant $contextTenantId as $contextAccount."
+if ($HighPrivilegedOnly) {
+    Write-ScanLog "HighPrivilegedOnly enabled: the report will only include objects with privileged or security-relevant signals. Base objects are still retrieved for name and role resolution."
+}
 
 Write-ScanLog "Retrieving base objects: users, groups, service principals, roles, role assignments and CA policies..."
 $allUsers = @(Invoke-GraphGetAllSafe -Uri "/users?`$select=id,displayName,userPrincipalName,mail,accountEnabled,userType,createdDateTime&`$top=999" -Context "Users")
@@ -1447,7 +1473,7 @@ for ($userPosition = 0; $userPosition -lt $usersToProcess.Count; $userPosition++
 
         $safeUserId = [System.Uri]::EscapeDataString($userId)
         $memberships = @(Invoke-GraphGetAllSafe -Uri "/users/$safeUserId/transitiveMemberOf/microsoft.graph.group?`$select=id,displayName,mailEnabled,securityEnabled,isAssignableToRole&`$top=999" -Context "Group memberships for user $userName")
-        $ownedObjects = @(Invoke-GraphGetAllSafe -Uri "/users/$safeUserId/ownedObjects?`$select=id,displayName,userPrincipalName,appId&`$top=999" -Context "Owned objects for user $userName")
+        $ownedObjects = @()
 
         $directRoleLabels = New-Object System.Collections.ArrayList
         foreach ($assignment in @(Get-RoleAssignmentsForPrincipal -PrincipalId $userId)) {
@@ -1473,6 +1499,11 @@ for ($userPosition = 0; $userPosition -lt $usersToProcess.Count; $userPosition++
             Add-Finding -Severity "Medium" -Area "Users" -ObjectName $userName -Detail ("Directory role(s): " + (($allRoleLabels | Select-Object -First 5) -join "; "))
         }
 
+        $includeUserRowByPrivilege = (-not $HighPrivilegedOnly) -or ($allRoleLabels.Count -gt 0)
+        if ($includeUserRowByPrivilege) {
+            $ownedObjects = @(Invoke-GraphGetAllSafe -Uri "/users/$safeUserId/ownedObjects?`$select=id,displayName,userPrincipalName,appId&`$top=999" -Context "Owned objects for user $userName")
+        }
+
         $ownedObjectLabels = @($ownedObjects | ForEach-Object {
             $type = Get-DirectoryObjectType -Object $_
             $name = Get-ObjectProperty -InputObject $_ -Name "displayName"
@@ -1483,6 +1514,11 @@ for ($userPosition = 0; $userPosition -lt $usersToProcess.Count; $userPosition++
         } | Sort-Object -Unique)
 
         $groupLabels = @($memberships | ForEach-Object { Get-GroupLabel -Group $_ } | Sort-Object -Unique)
+
+        $includeUserRow = (-not $HighPrivilegedOnly) -or ($allRoleLabels.Count -gt 0)
+        if (-not $includeUserRow) {
+            continue
+        }
 
         [void]$userRows.Add([pscustomobject]@{
             Name = ConvertTo-HtmlEncodedText $userName
@@ -1526,6 +1562,11 @@ foreach ($group in @(ConvertTo-SafeArray -Value $allGroups)) {
         Add-Finding -Severity "High" -Area "Groups" -ObjectName $groupName -Detail ("Group has directory role assignment(s): " + ($roleLabels -join "; "))
     }
 
+    $includeGroupRow = (-not $HighPrivilegedOnly) -or ($isAssignableToRole -eq $true) -or ($roleLabels.Count -gt 0)
+    if (-not $includeGroupRow) {
+        continue
+    }
+
     $groupRows.Add([pscustomobject]@{
         Name = ConvertTo-HtmlEncodedText $groupName
         RoleAssignable = New-BoolBadge -Value $isAssignableToRole
@@ -1561,6 +1602,8 @@ foreach ($sp in @(ConvertTo-SafeArray -Value $allServicePrincipals)) {
 
         $applicationPermissionLabels = @(Sort-PermissionLabels -PermissionLabels @($appRoleAssignments | ForEach-Object { Resolve-ApplicationPermissionLabel -AppRoleAssignment $_ }))
         $delegatedPermissionLabels = @(Sort-PermissionLabels -PermissionLabels (Resolve-DelegatedPermissionLabels -Oauth2PermissionGrants $oauth2PermissionGrants))
+        $highApplicationPermissionLabels = @(Get-HighPrivilegePermissionLabels -PermissionLabels $applicationPermissionLabels)
+        $highDelegatedPermissionLabels = @(Get-HighPrivilegePermissionLabels -PermissionLabels $delegatedPermissionLabels)
 
     $directoryRoleLabels = New-Object System.Collections.ArrayList
     foreach ($assignment in @(Get-RoleAssignmentsForPrincipal -PrincipalId $spId)) {
@@ -1586,24 +1629,34 @@ foreach ($sp in @(ConvertTo-SafeArray -Value $allServicePrincipals)) {
         }
     }
 
-    if ($userOwnerLabels.Count -eq 0) {
-        Add-Finding -Severity "High" -Area "Service Principals" -ObjectName $spName -Detail "No user owner found on the service principal."
-    }
+    # Not treated as a finding by default: many Microsoft/cloud-managed service principals have no user owner.
+    # Owner information remains visible in the Service Principals tab for review.
 
-    if ($applicationPermissionLabels.Count -gt 0) {
-        Add-Finding -Severity "Medium" -Area "Service Principals" -ObjectName $spName -Detail ("Application permissions: " + (($applicationPermissionLabels | Select-Object -First 5) -join "; "))
+    $findingApplicationPermissionLabels = if ($HighPrivilegedOnly) { @($highApplicationPermissionLabels) } else { @($applicationPermissionLabels) }
+    if ($findingApplicationPermissionLabels.Count -gt 0) {
+        Add-Finding -Severity "Medium" -Area "Service Principals" -ObjectName $spName -Detail ("Application permissions: " + (($findingApplicationPermissionLabels | Select-Object -First 5) -join "; "))
     }
 
     if ($directoryRoleLabels.Count -gt 0) {
         Add-Finding -Severity "High" -Area "Service Principals" -ObjectName $spName -Detail ("Directory role(s): " + ($directoryRoleLabels -join "; "))
     }
 
+    $includeServicePrincipalRow = (-not $HighPrivilegedOnly) -or ($directoryRoleLabels.Count -gt 0) -or ($highApplicationPermissionLabels.Count -gt 0) -or ($highDelegatedPermissionLabels.Count -gt 0)
+    if (-not $includeServicePrincipalRow) {
+        continue
+    }
+
+    $displayApplicationPermissionLabels = if ($HighPrivilegedOnly) { @($highApplicationPermissionLabels) } else { @($applicationPermissionLabels) }
+    $displayDelegatedPermissionLabels = if ($HighPrivilegedOnly) { @($highDelegatedPermissionLabels) } else { @($delegatedPermissionLabels) }
+    $applicationPermissionEmptyText = if ($HighPrivilegedOnly) { "No high-privilege application permissions found" } else { "No application permissions found" }
+    $delegatedPermissionEmptyText = if ($HighPrivilegedOnly) { "No high-privilege delegated permissions found" } else { "No delegated permissions found" }
+
         [void]$servicePrincipalRows.Add([pscustomobject]@{
             Name = ConvertTo-HtmlEncodedText $spName
             Type = ConvertTo-HtmlEncodedText (Get-ObjectProperty -InputObject $sp -Name "servicePrincipalType")
             Enabled = if ((Get-ObjectProperty -InputObject $sp -Name "accountEnabled") -eq $true) { New-Badge -Text "Enabled" -Class "ok" } else { New-Badge -Text "Disabled" -Class "neutral" }
-            ApplicationPermissions = New-HtmlDetailsList -Items $applicationPermissionLabels -SummaryPrefix "application permissions" -EmptyText "No application permissions found"
-            DelegatedPermissions = New-HtmlDetailsList -Items $delegatedPermissionLabels -SummaryPrefix "delegated permissions" -EmptyText "No delegated permissions found"
+            ApplicationPermissions = New-HtmlDetailsList -Items $displayApplicationPermissionLabels -SummaryPrefix "application permissions" -EmptyText $applicationPermissionEmptyText
+            DelegatedPermissions = New-HtmlDetailsList -Items $displayDelegatedPermissionLabels -SummaryPrefix "delegated permissions" -EmptyText $delegatedPermissionEmptyText
             DirectoryRoles = New-HtmlDetailsList -Items (@($directoryRoleLabels | Sort-Object -Unique)) -SummaryPrefix "directory roles" -EmptyText "No directory roles"
             UserOwners = New-HtmlDetailsList -Items (@($userOwnerLabels | Sort-Object -Unique)) -SummaryPrefix "user owners" -EmptyText "No user owners"
             OtherOwners = New-HtmlDetailsList -Items (@($nonUserOwnerLabels | Sort-Object -Unique)) -SummaryPrefix "other owners" -EmptyText "No other owners"
@@ -1651,6 +1704,11 @@ foreach ($policy in $allConditionalAccessPolicies | Sort-Object @{ Expression = 
     $state = Get-ObjectProperty -InputObject $policy -Name "state"
     if ($state -eq "disabled") {
         Add-Finding -Severity "Low" -Area "Conditional Access" -ObjectName $policyName -Detail "Policy is disabled."
+    }
+
+    $includeConditionalAccessRow = (-not $HighPrivilegedOnly) -or ($expandedExcludedUserLabels.Count -gt 0) -or ($excludeGroups.Count -gt 0) -or ($excludeRoles.Count -gt 0) -or ($state -ne "enabled")
+    if (-not $includeConditionalAccessRow) {
+        continue
     }
 
     $rawJson = ConvertTo-HtmlEncodedText (ConvertTo-JsonSafe -Value $policy)
@@ -1702,9 +1760,15 @@ foreach ($finding in $script:Findings | Sort-Object @{ Expression = { $_.Severit
 
 $roleAssignableGroupCount = @($allGroups | Where-Object { (Get-ObjectProperty -InputObject $_ -Name "isAssignableToRole") -eq $true }).Count
 $enabledCaCount = @($allConditionalAccessPolicies | Where-Object { (Get-ObjectProperty -InputObject $_ -Name "state") -eq "enabled" }).Count
-$spWithoutUserOwnerCount = @($script:Findings | Where-Object { $_.Area -eq "Service Principals" -and $_.Detail -like "No user owner*" }).Count
 $highFindingCount = @($script:Findings | Where-Object { $_.Severity -eq "High" }).Count
 $mediumFindingCount = @($script:Findings | Where-Object { $_.Severity -eq "Medium" }).Count
+$reportModeLabel = if ($HighPrivilegedOnly) { "High-privileged only" } else { "Full read-only scan" }
+$modeNote = if ($HighPrivilegedOnly) {
+    "<strong>Mode:</strong> HighPrivilegedOnly is enabled. The report only shows users with directory roles, role-assignable groups or groups with directory roles, service principals with directory roles or broad/high-impact API permissions, and Conditional Access policies with exclusions or non-enabled states. Base objects are still queried for name and role resolution."
+}
+else {
+    "<strong>Mode:</strong> Full scan. All retrieved users, groups, service principals and Conditional Access policies are shown."
+}
 
 $generatedAt = Get-Date -Format "yyyy-MM-dd HH:mm:ss zzz"
 $tenantId = ConvertTo-HtmlEncodedText $contextTenantId
@@ -1717,22 +1781,22 @@ $overviewHtml = @"
         <h1>Microsoft Entra ID Security Report</h1>
         <p class="subtitle">Tenant: <strong>$tenantId</strong> · Account: <strong>$account</strong> · Generated: <strong>$generatedAt</strong></p>
     </div>
-    <div class="hero-chip">Read-only scan</div>
+    <div class="hero-chip">$reportModeLabel</div>
 </div>
 
 <div class="cards">
-    <div class="card"><span>Users</span><strong>$($allUsers.Count)</strong></div>
-    <div class="card"><span>Groups</span><strong>$($allGroups.Count)</strong></div>
+    <div class="card"><span>Users shown</span><strong>$($userRows.Count)</strong></div>
+    <div class="card"><span>Groups shown</span><strong>$($groupRows.Count)</strong></div>
     <div class="card"><span>Role-assignable groups</span><strong>$roleAssignableGroupCount</strong></div>
-    <div class="card"><span>Service principals</span><strong>$($allServicePrincipals.Count)</strong></div>
-    <div class="card"><span>CA policies</span><strong>$($allConditionalAccessPolicies.Count)</strong></div>
+    <div class="card"><span>Service principals shown</span><strong>$($servicePrincipalRows.Count)</strong></div>
+    <div class="card"><span>CA policies shown</span><strong>$($conditionalAccessRows.Count)</strong></div>
     <div class="card"><span>Enabled CA policies</span><strong>$enabledCaCount</strong></div>
-    <div class="card"><span>SPs without user owner</span><strong>$spWithoutUserOwnerCount</strong></div>
     <div class="card"><span>Findings high / medium</span><strong>$highFindingCount / $mediumFindingCount</strong></div>
 </div>
 
 <div class="note">
-    <strong>Scope of this first version:</strong> active role assignments, memberships at scan time, service principal API permissions, owners and Conditional Access configuration. PIM eligible assignments and audit/sign-in logging are intentionally not included yet.
+    $modeNote<br />
+    <strong>Scope of this version:</strong> active role assignments, memberships at scan time, service principal API permissions, owners and Conditional Access configuration. PIM eligible assignments and audit/sign-in logging are intentionally not included yet.
 </div>
 "@
 
