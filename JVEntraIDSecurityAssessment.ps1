@@ -12,15 +12,15 @@
     Het script is read-only. Het wijzigt niets in Entra ID.
 
     Voorbeeld:
-        .\Invoke-EntraSecurityScan.ps1 -OutputPath .\EntraSecurityScan.html -OpenReport
+        .\JVEntraIDSecurityAssessment.ps1 -OutputPath .\EntraSecurityScan.html -OpenReport
 
     Device code login:
-        .\Invoke-EntraSecurityScan.ps1 -UseDeviceCode -OpenReport
+        .\JVEntraIDSecurityAssessment.ps1 -UseDeviceCode -OpenReport
 #>
 
 [CmdletBinding()]
 param(
-    [string]$OutputPath = (Join-Path (Get-Location) ("JVEntraSecurityAssessment_{0}.html" -f (Get-Date -Format "yyyyMMdd_HHmmss"))),
+    [string]$OutputPath = (Join-Path (Get-Location) ("JVEntraIDSecurityAssessment_{0}.html" -f (Get-Date -Format "yyyyMMdd_HHmmss"))),
 
     [string[]]$Scopes = @(
         "User.Read.All",
@@ -613,7 +613,7 @@ function New-TableRows {
             }
             $cells.Add("<td>$value</td>") | Out-Null
         }
-        $htmlRows.Add("<tr>$($cells -join "")</tr>") | Out-Null
+        $htmlRows.Add(("<tr>{0}</tr>" -f ($cells -join ""))) | Out-Null
     }
 
     return ($htmlRows -join "`n")
@@ -1204,7 +1204,7 @@ $account = ConvertTo-HtmlEncodedText $contextAccount
 $overviewHtml = @"
 <div class="hero">
     <div>
-        <p class="eyebrow">Entra ID Security Scan</p>
+        <p class="eyebrow">JVEntraIDSecurityAssessment</p>
         <h1>Microsoft Entra ID Security Rapport</h1>
         <p class="subtitle">Tenant: <strong>$tenantId</strong> · Account: <strong>$account</strong> · Gegenereerd: <strong>$generatedAt</strong></p>
     </div>
@@ -1594,7 +1594,7 @@ $html = @"
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>JV Entra ID Security Assessment</title>
+    <title>JVEntraIDSecurityAssessment</title>
     <style>$css</style>
 </head>
 <body>
