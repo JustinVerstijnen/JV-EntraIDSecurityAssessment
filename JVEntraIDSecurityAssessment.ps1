@@ -1,20 +1,36 @@
 <#
 .SYNOPSIS
-    Entra ID security scan met een modern HTML-rapport.
+    Runs a read-only Microsoft Entra ID security assessment and generates a modern HTML report.
 
 .DESCRIPTION
-    Deze eerste versie leest Entra ID objecten uit via Microsoft Graph PowerShell-authenticatie
-    en Microsoft Graph REST calls. Het rapport bevat tabbladen voor Gebruikers, Groups,
-    Service Principals en Conditional Access Policies.
+    This script reads Microsoft Entra ID objects through Microsoft Graph PowerShell authentication
+    and Microsoft Graph REST calls. The report contains tabs for Users, Groups,
+    Service Principals, Conditional Access Policies and Findings.
 
 .NOTES
-    Vereist: PowerShell 7+ aanbevolen en Microsoft.Graph.Authentication.
-    Het script is read-only. Het wijzigt niets in Entra ID.
+    Requirements: PowerShell 7+ is recommended and Microsoft.Graph.Authentication.
+    The script is read-only. It does not modify Microsoft Entra ID.
 
-    Voorbeeld:
-        .\JVEntraIDSecurityAssessment.ps1 -OutputPath .\EntraSecurityScan.html -OpenReport
+    Example:
+        .\JVEntraIDSecurityAssessment.ps1 -OutputPath .\JVEntraIDSecurityAssessment.html -OpenReport
 
-    Device code login:
+    By default, this script uses classic browser sign-in through Microsoft.Graph.Authentication 2.33.0.
+    v2.2: English report/UI, Findings tab moved to the end, Scan warnings tab removed, footer links to GitHub,
+          non-informative unknown API permission placeholders are filtered, and higher-risk permissions are sorted first.
+    v2.1: More robust user detail and service principal processing; fixed owner format-operator bug.
+    v1.9: Graph GET helper parses raw JSON to PSCustomObject and uses ArrayList for paging to avoid type binding issues.
+    v1.8: Graph GET helper uses HttpResponseMessage + raw JSON parsing to avoid SDK object conversion issues.
+    v1.4: Removed invalid delegated scope AppRoleAssignment.Read.All; Application.Read.All is used for appRoleAssignments.
+    If another Graph-auth assembly is already loaded in the current session, the script relaunches itself in a clean PowerShell session.
+    This helps avoid WAM issues and requires no app registration or certificate in the customer tenant.
+
+    Latest Graph auth module with WAM:
+        .\JVEntraIDSecurityAssessment.ps1 -UseWamAuth -OpenReport
+
+    App-only certificate authentication:
+        .\JVEntraIDSecurityAssessment.ps1 -TenantId <tenant-id> -ClientId <app-id> -CertificateThumbprint <thumbprint> -OpenReport
+
+    Device code sign-in:
         .\JVEntraIDSecurityAssessment.ps1 -UseDeviceCode -OpenReport
 #>
 
@@ -29,11 +45,20 @@ param(
         "Directory.Read.All",
         "RoleManagement.Read.Directory",
         "Policy.Read.All",
-        "AppRoleAssignment.Read.All",
         "DelegatedPermissionGrant.Read.All"
     ),
 
+    [string]$TenantId,
+
+    [string]$ClientId,
+
+    [string]$CertificateThumbprint,
+
     [switch]$UseDeviceCode,
+
+    [switch]$UseWamAuth,
+
+    [switch]$UseLegacyGraphAuthModule,
 
     [switch]$SkipCAGroupMemberExpansion,
 
@@ -46,10 +71,11 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$script:OriginalBoundParameters = @{} + $PSBoundParameters
 
 $script:GraphBaseUri = "https://graph.microsoft.com/v1.0"
-$script:ScanWarnings = New-Object System.Collections.Generic.List[object]
-$script:Findings = New-Object System.Collections.Generic.List[object]
+$script:ScanWarnings = New-Object System.Collections.ArrayList
+$script:Findings = New-Object System.Collections.ArrayList
 
 $script:UserById = @{}
 $script:GroupById = @{}
@@ -59,6 +85,8 @@ $script:RoleDefinitionByTemplateId = @{}
 $script:RoleAssignmentsByPrincipalId = @{}
 $script:GroupMembersCache = @{}
 $script:AllRoleAssignments = @()
+$script:StopAfterCleanRelaunch = $false
+$script:GraphRequestMode = $null
 
 function Write-ScanLog {
     param(
@@ -114,17 +142,48 @@ function Get-ObjectProperty {
         return $null
     }
 
+    # Invoke-MgGraphRequest kan afhankelijk van moduleversie hashtables,
+    # dictionaries, PSCustomObjects, JsonElement-achtige objects of SDK response objects teruggeven.
+    # Everything is intentionally wrapped in try/catch blocks so one unexpected output type does not break the entire scan.
     if ($InputObject -is [System.Collections.IDictionary]) {
-        if ($InputObject.Contains($Name)) {
-            return $InputObject[$Name]
+        try {
+            if ($InputObject.Contains($Name)) {
+                return $InputObject[$Name]
+            }
         }
+        catch { }
+
+        try {
+            if ($InputObject.ContainsKey($Name)) {
+                return $InputObject[$Name]
+            }
+        }
+        catch { }
+
+        try {
+            foreach ($key in @($InputObject.Keys)) {
+                if ([string]$key -eq $Name) {
+                    return $InputObject[$key]
+                }
+            }
+        }
+        catch { }
+
         return $null
     }
 
-    $property = $InputObject.PSObject.Properties[$Name]
-    if ($null -ne $property) {
-        return $property.Value
+    try {
+        $property = $InputObject.PSObject.Properties | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+        if ($null -ne $property) {
+            return $property.Value
+        }
     }
+    catch { }
+
+    try {
+        return ($InputObject | Select-Object -ExpandProperty $Name -ErrorAction Stop)
+    }
+    catch { }
 
     return $null
 }
@@ -189,6 +248,139 @@ function Get-FullGraphUri {
     return "$script:GraphBaseUri/$Uri"
 }
 
+function ConvertFrom-JsonTextSafe {
+    param([AllowNull()] [string]$JsonText)
+
+    if ([string]::IsNullOrWhiteSpace($JsonText)) {
+        return $null
+    }
+
+    # Bewust géén -AsHashtable: sommige PowerShell/Graph combinaties leveren daarna
+    # dictionary-types op die bij property/indexer binding "Argument types do not match" geven.
+    # PSCustomObject is hier voorspelbaarder, ook voor @odata.nextLink via PSObject.Properties.
+    try {
+        return ($JsonText | ConvertFrom-Json -Depth 100)
+    }
+    catch {
+        return $JsonText
+    }
+}
+
+function Convert-GraphResponse {
+    param([AllowNull()] [object]$Response)
+
+    if ($null -eq $Response) {
+        return $null
+    }
+
+    # Meest robuuste pad: raw HTTP response uitlezen en zélf JSON parsen.
+    # Daarmee vermijden we de objectconversie van Microsoft.Graph.Authentication,
+    # die in sommige module-combinaties "Argument types do not match" kan geven.
+    if ($Response -is [System.Net.Http.HttpResponseMessage]) {
+        $statusCode = [int]$Response.StatusCode
+        $rawBody = $null
+        try {
+            $rawBody = $Response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        }
+        catch {
+            $rawBody = ""
+        }
+
+        if (-not $Response.IsSuccessStatusCode) {
+            $bodyPreview = if ([string]::IsNullOrWhiteSpace($rawBody)) { "<geen response body>" } else { $rawBody }
+            throw "Graph HTTP $statusCode $($Response.ReasonPhrase): $bodyPreview"
+        }
+
+        return (ConvertFrom-JsonTextSafe -JsonText $rawBody)
+    }
+
+    if ($Response -is [string]) {
+        return (ConvertFrom-JsonTextSafe -JsonText $Response)
+    }
+
+    # Sommige moduleversies geven een wrapper met Content terug in plaats van een echte HttpResponseMessage.
+    try {
+        $contentProperty = $Response.PSObject.Properties | Where-Object { $_.Name -eq "Content" } | Select-Object -First 1
+        if ($null -ne $contentProperty -and $null -ne $contentProperty.Value) {
+            $content = $contentProperty.Value
+            if ($content -is [string]) {
+                return (ConvertFrom-JsonTextSafe -JsonText $content)
+            }
+            if ($content.PSObject.Methods.Name -contains "ReadAsStringAsync") {
+                $rawBody = $content.ReadAsStringAsync().GetAwaiter().GetResult()
+                return (ConvertFrom-JsonTextSafe -JsonText $rawBody)
+            }
+        }
+    }
+    catch { }
+
+    return $Response
+}
+
+function Get-ExceptionText {
+    param([Parameter(Mandatory)] [object]$ErrorRecord)
+
+    $parts = New-Object System.Collections.ArrayList
+    try { $parts.Add($ErrorRecord.Exception.Message) | Out-Null } catch { }
+    try {
+        if ($ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.ScriptLineNumber) {
+            $parts.Add(("line {0}" -f $ErrorRecord.InvocationInfo.ScriptLineNumber)) | Out-Null
+        }
+    }
+    catch { }
+    try {
+        if ($ErrorRecord.Exception.GetType().FullName) {
+            $parts.Add($ErrorRecord.Exception.GetType().FullName) | Out-Null
+        }
+    }
+    catch { }
+    try {
+        if ($ErrorRecord.ScriptStackTrace) {
+            $stackLine = (($ErrorRecord.ScriptStackTrace -split "`r?`n") | Select-Object -First 1)
+            if (-not [string]::IsNullOrWhiteSpace($stackLine)) {
+                $parts.Add($stackLine) | Out-Null
+            }
+        }
+    }
+    catch { }
+
+    return ($parts -join " | ")
+}
+
+function Invoke-MgGraphRequestCompat {
+    param([Parameter(Mandatory)] [string]$FullUri)
+
+    $errors = New-Object System.Collections.ArrayList
+
+    # HttpResponseMessage eerst. Dit geeft de meest voorspelbare response: raw HTTP + raw JSON.
+    # JSON/default output is only attempted afterwards as fallback.
+    $attempts = @(
+        @{ Name = "HttpResponseStringUri"; Script = { param($u) Invoke-MgGraphRequest -Method GET -Uri $u -OutputType HttpResponseMessage -ErrorAction Stop } },
+        @{ Name = "HttpResponseUriObject"; Script = { param($u) Invoke-MgGraphRequest -Method GET -Uri ([System.Uri]$u) -OutputType HttpResponseMessage -ErrorAction Stop } },
+        @{ Name = "JsonStringUri";         Script = { param($u) Invoke-MgGraphRequest -Method GET -Uri $u -OutputType Json -ErrorAction Stop } },
+        @{ Name = "JsonUriObject";         Script = { param($u) Invoke-MgGraphRequest -Method GET -Uri ([System.Uri]$u) -OutputType Json -ErrorAction Stop } },
+        @{ Name = "DefaultStringUri";      Script = { param($u) Invoke-MgGraphRequest -Method GET -Uri $u -ErrorAction Stop } },
+        @{ Name = "SplatStringUri";        Script = { param($u) $p = @{ Method = "GET"; Uri = $u; ErrorAction = "Stop" }; Invoke-MgGraphRequest @p } }
+    )
+
+    foreach ($attempt in $attempts) {
+        try {
+            $response = & $attempt.Script $FullUri
+            $converted = Convert-GraphResponse -Response $response
+            if (-not $script:GraphRequestMode) {
+                $script:GraphRequestMode = $attempt.Name
+                Write-ScanLog "Graph request mode selected: $($attempt.Name)." "Info"
+            }
+            return $converted
+        }
+        catch {
+            $errors.Add(("{0}: {1}" -f $attempt.Name, (Get-ExceptionText -ErrorRecord $_))) | Out-Null
+        }
+    }
+
+    throw ($errors -join " | ")
+}
+
 function Invoke-GraphGetRaw {
     param(
         [Parameter(Mandatory)] [string]$Uri,
@@ -200,7 +392,7 @@ function Invoke-GraphGetRaw {
 
     while ($true) {
         try {
-            return Invoke-MgGraphRequest -Method GET -Uri $fullUri -OutputType PSObject
+            return (Invoke-MgGraphRequestCompat -FullUri $fullUri)
         }
         catch {
             $attempt++
@@ -214,7 +406,7 @@ function Invoke-GraphGetRaw {
 
             if (($statusCode -in @(429, 500, 502, 503, 504)) -and ($attempt -le $MaxRetry)) {
                 $sleepSeconds = [Math]::Min(60, [Math]::Pow(2, $attempt))
-                Write-ScanLog "Graph throttling/tijdelijke fout op $fullUri. Retry over $sleepSeconds seconden." "Warn"
+                Write-ScanLog "Graph throttling/temporary error on $fullUri. Retry in $sleepSeconds seconds." "Warn"
                 Start-Sleep -Seconds $sleepSeconds
                 continue
             }
@@ -227,7 +419,9 @@ function Invoke-GraphGetRaw {
 function Invoke-GraphGetAll {
     param([Parameter(Mandatory)] [string]$Uri)
 
-    $items = New-Object System.Collections.Generic.List[object]
+    # ArrayList i.p.v. Generic Lists: voorkomt generic method binding issues
+    # met Graph/JSON objects in sommige PowerShell builds.
+    $items = New-Object System.Collections.ArrayList
     $nextLink = Get-FullGraphUri -Uri $Uri
 
     while (-not [string]::IsNullOrWhiteSpace($nextLink)) {
@@ -236,12 +430,18 @@ function Invoke-GraphGetAll {
 
         if ($null -ne $value) {
             foreach ($item in @($value)) {
-                $items.Add($item) | Out-Null
+                [void]$items.Add($item)
             }
-            $nextLink = Get-ObjectProperty -InputObject $response -Name "@odata.nextLink"
+            $nextLinkValue = Get-ObjectProperty -InputObject $response -Name "@odata.nextLink"
+            if ($null -eq $nextLinkValue) {
+                $nextLink = $null
+            }
+            else {
+                $nextLink = [string]$nextLinkValue
+            }
         }
         else {
-            $items.Add($response) | Out-Null
+            [void]$items.Add($response)
             $nextLink = $null
         }
 
@@ -250,7 +450,7 @@ function Invoke-GraphGetAll {
         }
     }
 
-    return @($items)
+    return @($items.ToArray())
 }
 
 function Invoke-GraphGetAllSafe {
@@ -263,8 +463,9 @@ function Invoke-GraphGetAllSafe {
         return @(Invoke-GraphGetAll -Uri $Uri)
     }
     catch {
-        Add-ScanWarning -Context $Context -Message $_.Exception.Message
-        Write-ScanLog "$Context kon niet worden opgehaald: $($_.Exception.Message)" "Warn"
+        $message = Get-ExceptionText -ErrorRecord $_
+        Add-ScanWarning -Context $Context -Message $message
+        Write-ScanLog "$Context could not be retrieved: $message" "Warn"
         return @()
     }
 }
@@ -284,7 +485,7 @@ function Get-UserLabel {
     param([AllowNull()] [object]$User)
 
     if ($null -eq $User) {
-        return "Onbekende gebruiker"
+        return "Unknown user"
     }
 
     $displayName = Get-ObjectProperty -InputObject $User -Name "displayName"
@@ -312,14 +513,14 @@ function Get-UserLabel {
         return $id
     }
 
-    return "Onbekende gebruiker"
+    return "Unknown user"
 }
 
 function Get-GroupLabel {
     param([AllowNull()] [object]$Group)
 
     if ($null -eq $Group) {
-        return "Onbekende groep"
+        return "Unknown group"
     }
 
     $displayName = Get-ObjectProperty -InputObject $Group -Name "displayName"
@@ -333,14 +534,14 @@ function Get-GroupLabel {
         return $id
     }
 
-    return "Onbekende groep"
+    return "Unknown group"
 }
 
 function Get-ServicePrincipalLabel {
     param([AllowNull()] [object]$ServicePrincipal)
 
     if ($null -eq $ServicePrincipal) {
-        return "Onbekende service principal"
+        return "Unknown service principal"
     }
 
     $displayName = Get-ObjectProperty -InputObject $ServicePrincipal -Name "displayName"
@@ -359,14 +560,14 @@ function Get-ServicePrincipalLabel {
         return $id
     }
 
-    return "Onbekende service principal"
+    return "Unknown service principal"
 }
 
 function Get-RoleName {
     param([AllowNull()] [string]$RoleDefinitionId)
 
     if ([string]::IsNullOrWhiteSpace($RoleDefinitionId)) {
-        return "Onbekende rol"
+        return "Unknown role"
     }
 
     if ($script:RoleDefinitionById.ContainsKey($RoleDefinitionId)) {
@@ -432,7 +633,7 @@ function Get-PrincipalLabelById {
     param([AllowNull()] [string]$Id)
 
     if ([string]::IsNullOrWhiteSpace($Id)) {
-        return "Onbekende principal"
+        return "Unknown principal"
     }
 
     if ($script:UserById.ContainsKey($Id)) {
@@ -458,7 +659,7 @@ function Get-RoleAssignmentsForPrincipal {
     }
 
     if ($script:RoleAssignmentsByPrincipalId.ContainsKey($PrincipalId)) {
-        return @($script:RoleAssignmentsByPrincipalId[$PrincipalId])
+        return @(ConvertTo-SafeArray -Value $script:RoleAssignmentsByPrincipalId[$PrincipalId])
     }
 
     return @()
@@ -467,11 +668,11 @@ function Get-RoleAssignmentsForPrincipal {
 function Get-GroupMembersTransitiveUsers {
     param(
         [Parameter(Mandatory)] [string]$GroupId,
-        [string]$Context = "Groepsleden"
+        [string]$Context = "Group members"
     )
 
     if ($script:GroupMembersCache.ContainsKey($GroupId)) {
-        return @($script:GroupMembersCache[$GroupId])
+        return @(ConvertTo-SafeArray -Value $script:GroupMembersCache[$GroupId])
     }
 
     $members = @(Invoke-GraphGetAllSafe -Uri "/groups/$GroupId/transitiveMembers/microsoft.graph.user?`$select=id,displayName,userPrincipalName,accountEnabled&`$top=999" -Context $Context)
@@ -480,9 +681,9 @@ function Get-GroupMembersTransitiveUsers {
 }
 
 function Resolve-UserIdsToLabels {
-    param([AllowNull()] [object[]]$Ids)
+    param([AllowNull()] [object]$Ids)
 
-    $labels = New-Object System.Collections.Generic.List[string]
+    $labels = New-Object System.Collections.ArrayList
 
     foreach ($id in @(ConvertTo-SafeArray -Value $Ids)) {
         if ([string]::IsNullOrWhiteSpace([string]$id)) {
@@ -490,7 +691,7 @@ function Resolve-UserIdsToLabels {
         }
 
         if ($id -in @("All", "None", "GuestsOrExternalUsers")) {
-            $labels.Add("Speciale waarde: $id") | Out-Null
+            $labels.Add("Special value: $id") | Out-Null
             continue
         }
 
@@ -498,7 +699,7 @@ function Resolve-UserIdsToLabels {
             $labels.Add((Get-UserLabel -User $script:UserById[[string]$id])) | Out-Null
         }
         else {
-            $labels.Add("Onbekend/verwijderd: $id") | Out-Null
+            $labels.Add("Unknown/deleted: $id") | Out-Null
         }
     }
 
@@ -506,9 +707,9 @@ function Resolve-UserIdsToLabels {
 }
 
 function Resolve-GroupIdsToLabels {
-    param([AllowNull()] [object[]]$Ids)
+    param([AllowNull()] [object]$Ids)
 
-    $labels = New-Object System.Collections.Generic.List[string]
+    $labels = New-Object System.Collections.ArrayList
 
     foreach ($id in @(ConvertTo-SafeArray -Value $Ids)) {
         if ([string]::IsNullOrWhiteSpace([string]$id)) {
@@ -519,7 +720,7 @@ function Resolve-GroupIdsToLabels {
             $labels.Add((Get-GroupLabel -Group $script:GroupById[[string]$id])) | Out-Null
         }
         else {
-            $labels.Add("Onbekend/verwijderd: $id") | Out-Null
+            $labels.Add("Unknown/deleted: $id") | Out-Null
         }
     }
 
@@ -527,9 +728,9 @@ function Resolve-GroupIdsToLabels {
 }
 
 function Resolve-RoleIdsToLabels {
-    param([AllowNull()] [object[]]$Ids)
+    param([AllowNull()] [object]$Ids)
 
-    $labels = New-Object System.Collections.Generic.List[string]
+    $labels = New-Object System.Collections.ArrayList
 
     foreach ($id in @(ConvertTo-SafeArray -Value $Ids)) {
         if ([string]::IsNullOrWhiteSpace([string]$id)) {
@@ -544,8 +745,8 @@ function Resolve-RoleIdsToLabels {
 
 function New-HtmlList {
     param(
-        [AllowNull()] [object[]]$Items,
-        [string]$EmptyText = "Geen"
+        [AllowNull()] [object]$Items,
+        [string]$EmptyText = "None"
     )
 
     $cleanItems = @($Items | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
@@ -559,9 +760,9 @@ function New-HtmlList {
 
 function New-HtmlDetailsList {
     param(
-        [AllowNull()] [object[]]$Items,
+        [AllowNull()] [object]$Items,
         [string]$SummaryPrefix = "items",
-        [string]$EmptyText = "Geen"
+        [string]$EmptyText = "None"
     )
 
     $cleanItems = @($Items | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
@@ -586,26 +787,26 @@ function New-BoolBadge {
     param([AllowNull()] [object]$Value)
 
     if ($Value -eq $true) {
-        return New-Badge -Text "Ja" -Class "warn"
+        return New-Badge -Text "Yes" -Class "warn"
     }
 
     if ($Value -eq $false) {
-        return New-Badge -Text "Nee" -Class "ok"
+        return New-Badge -Text "No" -Class "ok"
     }
 
-    return New-Badge -Text "Onbekend" -Class "neutral"
+    return New-Badge -Text "Unknown" -Class "neutral"
 }
 
 function New-TableRows {
     param(
-        [Parameter(Mandatory)] [object[]]$Rows,
+        [AllowEmptyCollection()] [object[]]$Rows,
         [Parameter(Mandatory)] [string[]]$Columns
     )
 
-    $htmlRows = New-Object System.Collections.Generic.List[string]
+    $htmlRows = New-Object System.Collections.ArrayList
 
     foreach ($row in $Rows) {
-        $cells = New-Object System.Collections.Generic.List[string]
+        $cells = New-Object System.Collections.ArrayList
         foreach ($column in $Columns) {
             $value = Get-ObjectProperty -InputObject $row -Name $column
             if ($null -eq $value) {
@@ -623,7 +824,7 @@ function New-DataTableHtml {
     param(
         [Parameter(Mandatory)] [string]$Id,
         [Parameter(Mandatory)] [string]$Title,
-        [Parameter(Mandatory)] [object[]]$Rows,
+        [AllowEmptyCollection()] [object[]]$Rows,
         [Parameter(Mandatory)] [string[]]$Columns,
         [Parameter(Mandatory)] [hashtable]$ColumnLabels
     )
@@ -632,14 +833,19 @@ function New-DataTableHtml {
     $tableRows = New-TableRows -Rows $Rows -Columns $Columns
     $count = @($Rows).Count
 
+    if ($count -eq 0) {
+        $colSpan = @($Columns).Count
+        $tableRows = "<tr><td colspan='$colSpan'><span class='muted'>No objects found or insufficient permissions.</span></td></tr>"
+    }
+
     return @"
 <div class="table-card">
     <div class="table-card-header">
         <div>
             <h2>$([System.Net.WebUtility]::HtmlEncode($Title))</h2>
-            <p>$count objecten</p>
+            <p>$count objects</p>
         </div>
-        <input class="table-search" type="search" placeholder="Zoeken..." oninput="filterTable('$Id', this.value)" />
+        <input class="table-search" type="search" placeholder="Search..." oninput="filterTable('$Id', this.value)" />
     </div>
     <div class="table-wrap">
         <table id="$Id">
@@ -685,16 +891,20 @@ function Resolve-ApplicationPermissionLabel {
     }
 
     if ([string]::IsNullOrWhiteSpace($resourceDisplayName)) {
-        $resourceDisplayName = "Onbekende API"
+        $resourceDisplayName = "Unknown API"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($permissionName)) {
+        return $null
     }
 
     return "$resourceDisplayName :: $permissionName"
 }
 
 function Resolve-DelegatedPermissionLabels {
-    param([AllowNull()] [object[]]$Oauth2PermissionGrants)
+    param([AllowNull()] [object]$Oauth2PermissionGrants)
 
-    $labels = New-Object System.Collections.Generic.List[string]
+    $labels = New-Object System.Collections.ArrayList
 
     foreach ($grant in @(ConvertTo-SafeArray -Value $Oauth2PermissionGrants)) {
         $resourceId = Get-ObjectProperty -InputObject $grant -Name "resourceId"
@@ -706,7 +916,7 @@ function Resolve-DelegatedPermissionLabels {
             continue
         }
 
-        $resourceName = "Onbekende API"
+        $resourceName = "Unknown API"
         if (-not [string]::IsNullOrWhiteSpace($resourceId) -and $script:ServicePrincipalById.ContainsKey([string]$resourceId)) {
             $resourceName = Get-ObjectProperty -InputObject $script:ServicePrincipalById[[string]$resourceId] -Name "displayName"
         }
@@ -724,11 +934,72 @@ function Resolve-DelegatedPermissionLabels {
     return @($labels)
 }
 
+function Test-EmptyPermissionLabel {
+    param([AllowNull()] [object]$PermissionLabel)
+
+    if ($null -eq $PermissionLabel) {
+        return $true
+    }
+
+    $label = ([string]$PermissionLabel).Trim()
+    if ([string]::IsNullOrWhiteSpace($label)) {
+        return $true
+    }
+
+    # Some tenants/resources return an appRoleAssignment placeholder without a resolvable API or permission value.
+    # These do not add actionable permission information to the report.
+    if ($label -match '^Unknown API\s*::\s*$') {
+        return $true
+    }
+
+    if ($label -match '^Unknown API\s*::\s*00000000-0000-0000-0000-000000000000\s*$') {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-PermissionRiskWeight {
+    param([AllowNull()] [object]$PermissionLabel)
+
+    if ($null -eq $PermissionLabel) {
+        return 0
+    }
+
+    $permission = [string]$PermissionLabel
+
+    # [Inference] This is a pragmatic display ordering, not a formal risk score.
+    # Broad write/admin permissions are shown first, broad read permissions second, then everything else.
+    if ($permission -match '(?i)(RoleManagement\.ReadWrite|Directory\.ReadWrite|AppRoleAssignment\.ReadWrite|Application\.ReadWrite\.All|Policy\.ReadWrite\.ConditionalAccess|PrivilegedAccess\.ReadWrite|User\.ReadWrite\.All|Group\.ReadWrite\.All|GroupMember\.ReadWrite|DeviceManagement.*ReadWrite|Sites\.FullControl|FullControl|\.ReadWrite\.All|Mail\.ReadWrite|Mail\.Send|Files\.ReadWrite\.All|Calendars\.ReadWrite|MailboxSettings\.ReadWrite|Exchange\.ManageAsApp)') {
+        return 100
+    }
+
+    if ($permission -match '(?i)(\.Read\.All|Directory\.Read\.All|User\.Read\.All|Group\.Read\.All|Application\.Read\.All|AuditLog\.Read\.All|Reports\.Read\.All|Policy\.Read\.All|SecurityEvents\.Read\.All|Mail\.Read|Files\.Read\.All|Sites\.Read\.All)') {
+        return 60
+    }
+
+    return 10
+}
+
+function Sort-PermissionLabels {
+    param([AllowNull()] [object]$PermissionLabels)
+
+    $clean = New-Object System.Collections.ArrayList
+    foreach ($label in @(ConvertTo-SafeArray -Value $PermissionLabels)) {
+        if (Test-EmptyPermissionLabel -PermissionLabel $label) {
+            continue
+        }
+        [void]$clean.Add([string]$label)
+    }
+
+    return @($clean | Sort-Object @{ Expression = { Get-PermissionRiskWeight -PermissionLabel $_ }; Descending = $true }, @{ Expression = { $_ }; Ascending = $true } -Unique)
+}
+
 function Get-ConditionalAccessExpandedExcludedUsers {
     param(
-        [AllowNull()] [object[]]$ExcludeUsers,
-        [AllowNull()] [object[]]$ExcludeGroups,
-        [AllowNull()] [object[]]$ExcludeRoles,
+        [AllowNull()] [object]$ExcludeUsers,
+        [AllowNull()] [object]$ExcludeGroups,
+        [AllowNull()] [object]$ExcludeRoles,
         [Parameter(Mandatory)] [string]$PolicyName
     )
 
@@ -746,12 +1017,12 @@ function Get-ConditionalAccessExpandedExcludedUsers {
         if ($script:UserById.ContainsKey([string]$userId)) {
             $excluded[[string]$userId] = [pscustomobject]@{
                 User = $script:UserById[[string]$userId]
-                Sources = New-Object System.Collections.Generic.List[string]
+                Sources = New-Object System.Collections.ArrayList
             }
-            $excluded[[string]$userId].Sources.Add("Directe user-exclusion") | Out-Null
+            $excluded[[string]$userId].Sources.Add("Direct user exclusion") | Out-Null
         }
         else {
-            Add-ScanWarning -Context "Conditional Access: $PolicyName" -Message "Excluded user ID niet gevonden: $userId"
+            Add-ScanWarning -Context "Conditional Access: $PolicyName" -Message "Excluded user ID not found: $userId"
         }
     }
 
@@ -766,7 +1037,7 @@ function Get-ConditionalAccessExpandedExcludedUsers {
                 $groupName = Get-GroupLabel -Group $script:GroupById[[string]$groupId]
             }
 
-            $members = @(Get-GroupMembersTransitiveUsers -GroupId ([string]$groupId) -Context "Conditional Access '$PolicyName' uitgesloten groep '$groupName'")
+            $members = @(Get-GroupMembersTransitiveUsers -GroupId ([string]$groupId) -Context "Conditional Access '$PolicyName' excluded group '$groupName'")
             foreach ($member in $members) {
                 $memberId = Get-ObjectProperty -InputObject $member -Name "id"
                 if ([string]::IsNullOrWhiteSpace($memberId)) {
@@ -776,10 +1047,10 @@ function Get-ConditionalAccessExpandedExcludedUsers {
                 if (-not $excluded.ContainsKey([string]$memberId)) {
                     $excluded[[string]$memberId] = [pscustomobject]@{
                         User = $member
-                        Sources = New-Object System.Collections.Generic.List[string]
+                        Sources = New-Object System.Collections.ArrayList
                     }
                 }
-                $excluded[[string]$memberId].Sources.Add("Groep: $groupName") | Out-Null
+                $excluded[[string]$memberId].Sources.Add("Group: $groupName") | Out-Null
             }
         }
     }
@@ -791,7 +1062,7 @@ function Get-ConditionalAccessExpandedExcludedUsers {
 
         $roleDefinition = Get-RoleDefinitionFromAnyId -RoleId ([string]$roleId)
         if ($null -eq $roleDefinition) {
-            Add-ScanWarning -Context "Conditional Access: $PolicyName" -Message "Excluded role ID kon niet worden gekoppeld aan een role definition: $roleId"
+            Add-ScanWarning -Context "Conditional Access: $PolicyName" -Message "Excluded role ID could not be mapped to a role definition: $roleId"
             continue
         }
 
@@ -807,14 +1078,14 @@ function Get-ConditionalAccessExpandedExcludedUsers {
                 if (-not $excluded.ContainsKey([string]$principalId)) {
                     $excluded[[string]$principalId] = [pscustomobject]@{
                         User = $script:UserById[[string]$principalId]
-                        Sources = New-Object System.Collections.Generic.List[string]
+                        Sources = New-Object System.Collections.ArrayList
                     }
                 }
                 $excluded[[string]$principalId].Sources.Add("Directory role: $roleName") | Out-Null
             }
             elseif ($principalType -eq "Group" -and -not $SkipCAGroupMemberExpansion) {
                 $groupName = Get-PrincipalLabelById -Id $principalId
-                $members = @(Get-GroupMembersTransitiveUsers -GroupId ([string]$principalId) -Context "Conditional Access '$PolicyName' uitgesloten role group '$groupName'")
+                $members = @(Get-GroupMembersTransitiveUsers -GroupId ([string]$principalId) -Context "Conditional Access '$PolicyName' excluded role group '$groupName'")
                 foreach ($member in $members) {
                     $memberId = Get-ObjectProperty -InputObject $member -Name "id"
                     if ([string]::IsNullOrWhiteSpace($memberId)) {
@@ -824,16 +1095,16 @@ function Get-ConditionalAccessExpandedExcludedUsers {
                     if (-not $excluded.ContainsKey([string]$memberId)) {
                         $excluded[[string]$memberId] = [pscustomobject]@{
                             User = $member
-                            Sources = New-Object System.Collections.Generic.List[string]
+                            Sources = New-Object System.Collections.ArrayList
                         }
                     }
-                    $excluded[[string]$memberId].Sources.Add("Directory role: $roleName via groep $groupName") | Out-Null
+                    $excluded[[string]$memberId].Sources.Add("Directory role: $roleName via group $groupName") | Out-Null
                 }
             }
         }
     }
 
-    $labels = New-Object System.Collections.Generic.List[string]
+    $labels = New-Object System.Collections.ArrayList
     foreach ($entry in $excluded.GetEnumerator() | Sort-Object Name) {
         $userLabel = Get-UserLabel -User $entry.Value.User
         $sources = (@($entry.Value.Sources) | Sort-Object -Unique) -join "; "
@@ -843,53 +1114,265 @@ function Get-ConditionalAccessExpandedExcludedUsers {
     return @($labels)
 }
 
+
+function ConvertTo-ForwardArgumentList {
+    param(
+        [Parameter(Mandatory)] [hashtable]$Parameters
+    )
+
+    $arguments = New-Object System.Collections.ArrayList
+
+    foreach ($entry in $Parameters.GetEnumerator()) {
+        $name = [string]$entry.Key
+        $value = $entry.Value
+
+        if ($null -eq $value) {
+            continue
+        }
+
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) {
+                $arguments.Add("-$name") | Out-Null
+            }
+            continue
+        }
+
+        if ($value -is [bool]) {
+            if ($value) {
+                $arguments.Add("-$name") | Out-Null
+            }
+            continue
+        }
+
+        $arguments.Add("-$name") | Out-Null
+
+        if ($value -is [array] -and -not ($value -is [string])) {
+            foreach ($item in $value) {
+                if ($null -ne $item) {
+                    $arguments.Add([string]$item) | Out-Null
+                }
+            }
+        }
+        else {
+            $arguments.Add([string]$value) | Out-Null
+        }
+    }
+
+    return @($arguments)
+}
+
+function Get-LoadedGraphAuthenticationAssemblyVersion {
+    $assembly = [System.AppDomain]::CurrentDomain.GetAssemblies() |
+        Where-Object { $_.GetName().Name -eq "Microsoft.Graph.Authentication" } |
+        Select-Object -First 1
+
+    if ($null -eq $assembly) {
+        return $null
+    }
+
+    return $assembly.GetName().Version
+}
+
+function Invoke-CleanPowerShellRelaunch {
+    param(
+        [Parameter(Mandatory)] [string]$Reason,
+        [Parameter(Mandatory)] [hashtable]$BoundParametersToForward
+    )
+
+    if ($env:JV_EIDSA_CLEAN_RELAUNCH -eq "1") {
+        throw "A clean PowerShell session has already been started, but the Graph-auth assembly conflict remains. Close all PowerShell windows and run the script again with: pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -OpenReport"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        throw "The script path could not be determined. Run the script as a file, for example: .\JVEntraIDSecurityAssessment.ps1 -OpenReport"
+    }
+
+    $pwshCommand = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($null -eq $pwshCommand) {
+        $pwshCommand = Get-Command powershell -ErrorAction SilentlyContinue
+    }
+
+    if ($null -eq $pwshCommand) {
+        throw "No pwsh or powershell executable was found to start a clean session. Open a new PowerShell 7 session and run the script again."
+    }
+
+    Write-ScanLog $Reason "Warn"
+    Write-ScanLog "Automatically relaunching in a clean PowerShell session without profile: $($pwshCommand.Source)" "Info"
+
+    $forwardArgs = ConvertTo-ForwardArgumentList -Parameters $BoundParametersToForward
+    $env:JV_EIDSA_CLEAN_RELAUNCH = "1"
+
+    try {
+        & $pwshCommand.Source -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forwardArgs
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        Remove-Item Env:\JV_EIDSA_CLEAN_RELAUNCH -ErrorAction SilentlyContinue
+    }
+
+    if ($null -ne $exitCode -and $exitCode -ne 0) {
+        throw "The clean PowerShell session stopped with exit code $exitCode."
+    }
+
+    $script:StopAfterCleanRelaunch = $true
+}
+
 function Ensure-MicrosoftGraphAuthenticationModule {
-    $module = Get-Module -ListAvailable -Name Microsoft.Graph.Authentication | Sort-Object Version -Descending | Select-Object -First 1
+    param(
+        [switch]$UseLegacyGraphAuthModule
+    )
+
+    $moduleName = "Microsoft.Graph.Authentication"
+
+    if ($UseLegacyGraphAuthModule) {
+        $requiredVersion = "2.33.0"
+        $requiredAssemblyVersion = [version]"2.33.0.0"
+        $loadedAssemblyVersion = Get-LoadedGraphAuthenticationAssemblyVersion
+
+        if ($null -ne $loadedAssemblyVersion -and $loadedAssemblyVersion -ne $requiredAssemblyVersion) {
+            Invoke-CleanPowerShellRelaunch `
+                -Reason "Microsoft.Graph.Authentication assembly $loadedAssemblyVersion is already loaded in this session. Version $requiredAssemblyVersion is required for classic browser authentication without WAM." `
+                -BoundParametersToForward $script:OriginalBoundParameters
+            return
+        }
+
+        $exactModule = Get-Module -ListAvailable -Name $moduleName | Where-Object { $_.Version -eq [version]$requiredVersion } | Select-Object -First 1
+
+        if ($null -eq $exactModule) {
+            Write-ScanLog "$moduleName $requiredVersion was not found. Installation will be attempted from PowerShell Gallery." "Warn"
+            Install-Module $moduleName -RequiredVersion $requiredVersion -Scope CurrentUser -Force -AllowClobber
+        }
+
+        foreach ($loadedModule in @(Get-Module -Name $moduleName)) {
+            Remove-Module $loadedModule.Name -Force -ErrorAction SilentlyContinue
+        }
+
+        try {
+            Import-Module $moduleName -RequiredVersion $requiredVersion -Force -ErrorAction Stop
+        }
+        catch {
+            if ($_.Exception.Message -match "Assembly with same name is already loaded") {
+                Invoke-CleanPowerShellRelaunch `
+                    -Reason "PowerShell has already loaded another Graph-auth assembly in this session. A clean session is required to load version $requiredAssemblyVersion ." `
+                    -BoundParametersToForward $script:OriginalBoundParameters
+                return
+            }
+
+            throw
+        }
+
+        Write-ScanLog "$moduleName $requiredVersion geladen voor legacy browser-authenticatie zonder WAM."
+        return
+    }
+
+    $module = Get-Module -ListAvailable -Name $moduleName | Sort-Object Version -Descending | Select-Object -First 1
     if ($null -eq $module) {
-        Write-ScanLog "Microsoft.Graph.Authentication is niet gevonden. Installatie wordt geprobeerd via PowerShell Gallery." "Warn"
-        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
+        Write-ScanLog "$moduleName was not found. Installation will be attempted from PowerShell Gallery." "Warn"
+        Install-Module $moduleName -Scope CurrentUser -Force -AllowClobber
     }
 
-    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    Import-Module $moduleName -ErrorAction Stop
 }
 
-Write-ScanLog "Modulecontrole..."
-Ensure-MicrosoftGraphAuthenticationModule
+Write-ScanLog "Checking modules..."
+$useCertificateAuth = (-not [string]::IsNullOrWhiteSpace($ClientId) -and -not [string]::IsNullOrWhiteSpace($CertificateThumbprint))
+$useClassicBrowserAuth = (-not $UseWamAuth -and -not $UseDeviceCode -and -not $useCertificateAuth)
 
-Write-ScanLog "Verbinden met Microsoft Graph..."
+if ($UseLegacyGraphAuthModule) {
+    $useClassicBrowserAuth = $true
+}
+
+Ensure-MicrosoftGraphAuthenticationModule -UseLegacyGraphAuthModule:$useClassicBrowserAuth
+
+if ($script:StopAfterCleanRelaunch) {
+    return
+}
+
+Write-ScanLog "Connecting to Microsoft Graph..."
 $connectCommand = Get-Command Connect-MgGraph -ErrorAction Stop
-$connectParams = @{
-    Scopes = $Scopes
+
+if ($useClassicBrowserAuth) {
+    try {
+        Set-MgGraphOption -DisableLoginByWAM $true -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-ScanLog "The WAM-disable option could not be set. The loaded Graph version determines whether this has any effect." "Warn"
+    }
+
+    Write-ScanLog "Classic browser sign-in is active through Microsoft.Graph.Authentication 2.33.0. No tenant preparation is required; consent uses the standard Microsoft Graph tooling app."
+}
+elseif ($UseWamAuth) {
+    Write-ScanLog "WAM authentication is active through the latest Microsoft.Graph.Authentication module."
 }
 
-if ($connectCommand.Parameters.ContainsKey("NoWelcome")) {
-    $connectParams["NoWelcome"] = $true
-}
+if ($ClientId -and $CertificateThumbprint) {
+    if ([string]::IsNullOrWhiteSpace($TenantId)) {
+        throw "TenantId is required when ClientId and CertificateThumbprint are used."
+    }
 
-if ($UseDeviceCode) {
-    if ($connectCommand.Parameters.ContainsKey("UseDeviceCode")) {
-        $connectParams["UseDeviceCode"] = $true
+    $connectParams = @{
+        TenantId              = $TenantId
+        ClientId              = $ClientId
+        CertificateThumbprint = $CertificateThumbprint
     }
-    elseif ($connectCommand.Parameters.ContainsKey("UseDeviceAuthentication")) {
-        $connectParams["UseDeviceAuthentication"] = $true
-    }
-    else {
-        Write-ScanLog "Deze versie van Connect-MgGraph lijkt geen device-code parameter te hebben. Interactieve login wordt gebruikt." "Warn"
-    }
-}
 
-Connect-MgGraph @connectParams | Out-Null
+    if ($connectCommand.Parameters.ContainsKey("NoWelcome")) {
+        $connectParams["NoWelcome"] = $true
+    }
+
+    if ($connectCommand.Parameters.ContainsKey("ContextScope")) {
+        $connectParams["ContextScope"] = "Process"
+    }
+
+    Write-ScanLog "Connecting through app-only certificate authentication."
+    Connect-MgGraph @connectParams | Out-Null
+}
+else {
+    $connectParams = @{
+        Scopes = $Scopes
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $connectParams["TenantId"] = $TenantId
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ClientId)) {
+        $connectParams["ClientId"] = $ClientId
+    }
+
+    if ($connectCommand.Parameters.ContainsKey("NoWelcome")) {
+        $connectParams["NoWelcome"] = $true
+    }
+
+    if ($connectCommand.Parameters.ContainsKey("ContextScope")) {
+        $connectParams["ContextScope"] = "Process"
+    }
+
+    if ($UseDeviceCode) {
+        if ($connectCommand.Parameters.ContainsKey("UseDeviceCode")) {
+            $connectParams["UseDeviceCode"] = $true
+        }
+        elseif ($connectCommand.Parameters.ContainsKey("UseDeviceAuthentication")) {
+            $connectParams["UseDeviceAuthentication"] = $true
+        }
+        else {
+            Write-ScanLog "This version of Connect-MgGraph does not appear to have a device-code parameter. Interactive sign-in will be used." "Warn"
+        }
+    }
+
+    Connect-MgGraph @connectParams | Out-Null
+}
 $context = Get-MgContext
 $contextTenantId = Get-ObjectProperty -InputObject $context -Name "TenantId"
 $contextAccount = Get-ObjectProperty -InputObject $context -Name "Account"
-Write-ScanLog "Verbonden met tenant $contextTenantId als $contextAccount."
+Write-ScanLog "Connected to tenant $contextTenantId as $contextAccount."
 
-Write-ScanLog "Basisobjecten ophalen: users, groups, service principals, roles, role assignments en CA policies..."
+Write-ScanLog "Retrieving base objects: users, groups, service principals, roles, role assignments and CA policies..."
 $allUsers = @(Invoke-GraphGetAllSafe -Uri "/users?`$select=id,displayName,userPrincipalName,mail,accountEnabled,userType,createdDateTime&`$top=999" -Context "Users")
 $allGroups = @(Invoke-GraphGetAllSafe -Uri "/groups?`$select=id,displayName,description,mail,mailEnabled,securityEnabled,groupTypes,isAssignableToRole,visibility,createdDateTime&`$top=999" -Context "Groups")
 $allServicePrincipals = @(Invoke-GraphGetAllSafe -Uri "/servicePrincipals?`$select=id,appId,displayName,accountEnabled,servicePrincipalType,appOwnerOrganizationId,createdDateTime,tags,appRoles,publishedPermissionScopes&`$top=999" -Context "Service principals")
-$allRoleDefinitions = @(Invoke-GraphGetAllSafe -Uri "/roleManagement/directory/roleDefinitions?`$select=id,templateId,displayName,description,isBuiltIn,isEnabled&`$top=999" -Context "Role definitions")
-$script:AllRoleAssignments = @(Invoke-GraphGetAllSafe -Uri "/roleManagement/directory/roleAssignments?`$select=id,principalId,roleDefinitionId,directoryScopeId,appScopeId,condition&`$top=999" -Context "Role assignments")
+$allRoleDefinitions = @(Invoke-GraphGetAllSafe -Uri "/roleManagement/directory/roleDefinitions" -Context "Role definitions")
+$script:AllRoleAssignments = @(Invoke-GraphGetAllSafe -Uri "/roleManagement/directory/roleAssignments" -Context "Role assignments")
 $allConditionalAccessPolicies = @(Invoke-GraphGetAllSafe -Uri "/identity/conditionalAccess/policies?`$top=999" -Context "Conditional Access policies")
 
 foreach ($user in $allUsers) {
@@ -933,81 +1416,100 @@ foreach ($assignment in $script:AllRoleAssignments) {
     }
 
     if (-not $script:RoleAssignmentsByPrincipalId.ContainsKey([string]$principalId)) {
-        $script:RoleAssignmentsByPrincipalId[[string]$principalId] = New-Object System.Collections.Generic.List[object]
+        $script:RoleAssignmentsByPrincipalId[[string]$principalId] = New-Object System.Collections.ArrayList
     }
 
     $script:RoleAssignmentsByPrincipalId[[string]$principalId].Add($assignment) | Out-Null
 }
 
-Write-ScanLog "Gebruikersdetails ophalen: group memberships en owned objects..."
-$userRows = New-Object System.Collections.Generic.List[object]
+Write-ScanLog "Retrieving user details: group memberships and owned objects..."
+$userRows = New-Object System.Collections.ArrayList
 $userIndex = 0
-foreach ($user in $allUsers | Sort-Object @{ Expression = { Get-ObjectProperty -InputObject $_ -Name "displayName" } }) {
+$usersToProcess = [object[]]@(ConvertTo-SafeArray -Value $allUsers)
+for ($userPosition = 0; $userPosition -lt $usersToProcess.Count; $userPosition++) {
+    $user = $usersToProcess[$userPosition]
     $userIndex++
     if (($userIndex % 25) -eq 0) {
-        Write-ScanLog "Gebruikers verwerkt: $userIndex / $($allUsers.Count)"
+        Write-ScanLog "Users processed: $userIndex / $($usersToProcess.Count)"
     }
 
-    $userId = Get-ObjectProperty -InputObject $user -Name "id"
-    $userName = Get-UserLabel -User $user
+    $userId = $null
+    $userName = "Unknown user"
 
-    $memberships = @(Invoke-GraphGetAllSafe -Uri "/users/$userId/transitiveMemberOf/microsoft.graph.group?`$select=id,displayName,mailEnabled,securityEnabled,isAssignableToRole&`$top=999" -Context "Groepslidmaatschap gebruiker $userName")
-    $ownedObjects = @(Invoke-GraphGetAllSafe -Uri "/users/$userId/ownedObjects?`$select=id,displayName,userPrincipalName,appId&`$top=999" -Context "Owned objects gebruiker $userName")
+    try {
+        $userId = [string](Get-ObjectProperty -InputObject $user -Name "id")
+        $userName = Get-UserLabel -User $user
 
-    $directRoleLabels = New-Object System.Collections.Generic.List[string]
-    foreach ($assignment in @(Get-RoleAssignmentsForPrincipal -PrincipalId $userId)) {
-        $roleDefinitionId = Get-ObjectProperty -InputObject $assignment -Name "roleDefinitionId"
-        $scope = Get-ObjectProperty -InputObject $assignment -Name "directoryScopeId"
-        if ([string]::IsNullOrWhiteSpace($scope)) { $scope = Get-ObjectProperty -InputObject $assignment -Name "appScopeId" }
-        if ([string]::IsNullOrWhiteSpace($scope)) { $scope = "/" }
-        $directRoleLabels.Add("$(Get-RoleName -RoleDefinitionId $roleDefinitionId) (Direct, scope: $scope)") | Out-Null
-    }
-
-    $groupRoleLabels = New-Object System.Collections.Generic.List[string]
-    foreach ($group in $memberships) {
-        $groupId = Get-ObjectProperty -InputObject $group -Name "id"
-        $groupName = Get-GroupLabel -Group $group
-        foreach ($assignment in @(Get-RoleAssignmentsForPrincipal -PrincipalId $groupId)) {
-            $roleDefinitionId = Get-ObjectProperty -InputObject $assignment -Name "roleDefinitionId"
-            $groupRoleLabels.Add("$(Get-RoleName -RoleDefinitionId $roleDefinitionId) (Via groep: $groupName)") | Out-Null
+        if ([string]::IsNullOrWhiteSpace($userId)) {
+            Add-ScanWarning -Context "Users" -Message "User without id skipped: $userName"
+            continue
         }
+
+        $safeUserId = [System.Uri]::EscapeDataString($userId)
+        $memberships = @(Invoke-GraphGetAllSafe -Uri "/users/$safeUserId/transitiveMemberOf/microsoft.graph.group?`$select=id,displayName,mailEnabled,securityEnabled,isAssignableToRole&`$top=999" -Context "Group memberships for user $userName")
+        $ownedObjects = @(Invoke-GraphGetAllSafe -Uri "/users/$safeUserId/ownedObjects?`$select=id,displayName,userPrincipalName,appId&`$top=999" -Context "Owned objects for user $userName")
+
+        $directRoleLabels = New-Object System.Collections.ArrayList
+        foreach ($assignment in @(Get-RoleAssignmentsForPrincipal -PrincipalId $userId)) {
+            $roleDefinitionId = Get-ObjectProperty -InputObject $assignment -Name "roleDefinitionId"
+            $scope = Get-ObjectProperty -InputObject $assignment -Name "directoryScopeId"
+            if ([string]::IsNullOrWhiteSpace($scope)) { $scope = Get-ObjectProperty -InputObject $assignment -Name "appScopeId" }
+            if ([string]::IsNullOrWhiteSpace($scope)) { $scope = "/" }
+            [void]$directRoleLabels.Add("$(Get-RoleName -RoleDefinitionId $roleDefinitionId) (Direct, scope: $scope)")
+        }
+
+        $groupRoleLabels = New-Object System.Collections.ArrayList
+        foreach ($group in @(ConvertTo-SafeArray -Value $memberships)) {
+            $groupId = Get-ObjectProperty -InputObject $group -Name "id"
+            $groupName = Get-GroupLabel -Group $group
+            foreach ($assignment in @(Get-RoleAssignmentsForPrincipal -PrincipalId $groupId)) {
+                $roleDefinitionId = Get-ObjectProperty -InputObject $assignment -Name "roleDefinitionId"
+                [void]$groupRoleLabels.Add("$(Get-RoleName -RoleDefinitionId $roleDefinitionId) (Via group: $groupName)")
+            }
+        }
+
+        $allRoleLabels = @((@($directRoleLabels) + @($groupRoleLabels)) | Sort-Object -Unique)
+        if ($allRoleLabels.Count -gt 0) {
+            Add-Finding -Severity "Medium" -Area "Users" -ObjectName $userName -Detail ("Directory role(s): " + (($allRoleLabels | Select-Object -First 5) -join "; "))
+        }
+
+        $ownedObjectLabels = @($ownedObjects | ForEach-Object {
+            $type = Get-DirectoryObjectType -Object $_
+            $name = Get-ObjectProperty -InputObject $_ -Name "displayName"
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = Get-ObjectProperty -InputObject $_ -Name "userPrincipalName" }
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = Get-ObjectProperty -InputObject $_ -Name "appId" }
+            if ([string]::IsNullOrWhiteSpace($name)) { $name = Get-ObjectProperty -InputObject $_ -Name "id" }
+            [string]::Format("{0}: {1}", $type, $name)
+        } | Sort-Object -Unique)
+
+        $groupLabels = @($memberships | ForEach-Object { Get-GroupLabel -Group $_ } | Sort-Object -Unique)
+
+        [void]$userRows.Add([pscustomobject]@{
+            Name = ConvertTo-HtmlEncodedText $userName
+            Enabled = if ((Get-ObjectProperty -InputObject $user -Name "accountEnabled") -eq $true) { New-Badge -Text "Enabled" -Class "ok" } else { New-Badge -Text "Disabled" -Class "neutral" }
+            UserType = ConvertTo-HtmlEncodedText (Get-ObjectProperty -InputObject $user -Name "userType")
+            DirectoryRoles = New-HtmlDetailsList -Items $allRoleLabels -SummaryPrefix "roles" -EmptyText "No active direct or group-based directory roles found"
+            OwnedObjects = New-HtmlDetailsList -Items $ownedObjectLabels -SummaryPrefix "owned objects" -EmptyText "No owned objects found"
+            Groups = New-HtmlDetailsList -Items $groupLabels -SummaryPrefix "groups" -EmptyText "No groups found"
+        })
     }
-
-    $allRoleLabels = @((@($directRoleLabels) + @($groupRoleLabels)) | Sort-Object -Unique)
-    if ($allRoleLabels.Count -gt 0) {
-        Add-Finding -Severity "Medium" -Area "Gebruikers" -ObjectName $userName -Detail ("Directory role(s): " + (($allRoleLabels | Select-Object -First 5) -join "; "))
+    catch {
+        $message = Get-ExceptionText -ErrorRecord $_
+        Add-ScanWarning -Context "Usersdetails $userName" -Message $message
+        Write-ScanLog "User skipped due to error: $userName - $message" "Warn"
+        continue
     }
-
-    $ownedObjectLabels = @($ownedObjects | ForEach-Object {
-        $type = Get-DirectoryObjectType -Object $_
-        $name = Get-ObjectProperty -InputObject $_ -Name "displayName"
-        if ([string]::IsNullOrWhiteSpace($name)) { $name = Get-ObjectProperty -InputObject $_ -Name "userPrincipalName" }
-        if ([string]::IsNullOrWhiteSpace($name)) { $name = Get-ObjectProperty -InputObject $_ -Name "appId" }
-        if ([string]::IsNullOrWhiteSpace($name)) { $name = Get-ObjectProperty -InputObject $_ -Name "id" }
-        "{0}: {1}" -f $type, $name
-    } | Sort-Object -Unique)
-
-    $groupLabels = @($memberships | ForEach-Object { Get-GroupLabel -Group $_ } | Sort-Object -Unique)
-
-    $userRows.Add([pscustomobject]@{
-        Name = ConvertTo-HtmlEncodedText $userName
-        Enabled = if ((Get-ObjectProperty -InputObject $user -Name "accountEnabled") -eq $true) { New-Badge -Text "Enabled" -Class "ok" } else { New-Badge -Text "Disabled" -Class "neutral" }
-        UserType = ConvertTo-HtmlEncodedText (Get-ObjectProperty -InputObject $user -Name "userType")
-        DirectoryRoles = New-HtmlDetailsList -Items $allRoleLabels -SummaryPrefix "rollen" -EmptyText "Geen actieve directe of groep-gebaseerde directory roles gevonden"
-        OwnedObjects = New-HtmlDetailsList -Items $ownedObjectLabels -SummaryPrefix "owned objects" -EmptyText "Geen owned objects gevonden"
-        Groups = New-HtmlDetailsList -Items $groupLabels -SummaryPrefix "groepen" -EmptyText "Geen groepen gevonden"
-    }) | Out-Null
 }
 
-Write-ScanLog "Groups verwerken..."
-$groupRows = New-Object System.Collections.Generic.List[object]
-foreach ($group in $allGroups | Sort-Object @{ Expression = { Get-ObjectProperty -InputObject $_ -Name "displayName" } }) {
+Write-ScanLog "Processing groups..."
+$groupRows = New-Object System.Collections.ArrayList
+foreach ($group in @(ConvertTo-SafeArray -Value $allGroups)) {
     $groupId = Get-ObjectProperty -InputObject $group -Name "id"
     $groupName = Get-GroupLabel -Group $group
     $isAssignableToRole = Get-ObjectProperty -InputObject $group -Name "isAssignableToRole"
     $groupTypes = ConvertTo-SafeArray -Value (Get-ObjectProperty -InputObject $group -Name "groupTypes")
 
-    $roleLabels = New-Object System.Collections.Generic.List[string]
+    $roleLabels = New-Object System.Collections.ArrayList
     foreach ($assignment in @(Get-RoleAssignmentsForPrincipal -PrincipalId $groupId)) {
         $roleDefinitionId = Get-ObjectProperty -InputObject $assignment -Name "roleDefinitionId"
         $scope = Get-ObjectProperty -InputObject $assignment -Name "directoryScopeId"
@@ -1017,11 +1519,11 @@ foreach ($group in $allGroups | Sort-Object @{ Expression = { Get-ObjectProperty
     }
 
     if ($isAssignableToRole -eq $true) {
-        Add-Finding -Severity "Medium" -Area "Groups" -ObjectName $groupName -Detail "Groep is role-assignable. Controleer eigenaarschap, membership governance en PIM/Access Reviews."
+        Add-Finding -Severity "Medium" -Area "Groups" -ObjectName $groupName -Detail "Group is role-assignable. Review ownership, membership governance and PIM/Access Reviews."
     }
 
     if ($roleLabels.Count -gt 0) {
-        Add-Finding -Severity "High" -Area "Groups" -ObjectName $groupName -Detail ("Groep heeft directory role assignment(s): " + ($roleLabels -join "; "))
+        Add-Finding -Severity "High" -Area "Groups" -ObjectName $groupName -Detail ("Group has directory role assignment(s): " + ($roleLabels -join "; "))
     }
 
     $groupRows.Add([pscustomobject]@{
@@ -1029,31 +1531,38 @@ foreach ($group in $allGroups | Sort-Object @{ Expression = { Get-ObjectProperty
         RoleAssignable = New-BoolBadge -Value $isAssignableToRole
         SecurityEnabled = New-BoolBadge -Value (Get-ObjectProperty -InputObject $group -Name "securityEnabled")
         MailEnabled = New-BoolBadge -Value (Get-ObjectProperty -InputObject $group -Name "mailEnabled")
-        GroupTypes = New-HtmlList -Items $groupTypes -EmptyText "Geen"
-        DirectoryRoles = New-HtmlDetailsList -Items (@($roleLabels | Sort-Object -Unique)) -SummaryPrefix "rollen" -EmptyText "Geen directory roles"
+        GroupTypes = New-HtmlList -Items $groupTypes -EmptyText "None"
+        DirectoryRoles = New-HtmlDetailsList -Items (@($roleLabels | Sort-Object -Unique)) -SummaryPrefix "roles" -EmptyText "No directory roles"
     }) | Out-Null
 }
 
-Write-ScanLog "Service principals verwerken: API-permissies, directory roles en owners..."
-$servicePrincipalRows = New-Object System.Collections.Generic.List[object]
+Write-ScanLog "Processing service principals: API permissions, directory roles and owners..."
+$servicePrincipalRows = New-Object System.Collections.ArrayList
 $spIndex = 0
-foreach ($sp in $allServicePrincipals | Sort-Object @{ Expression = { Get-ObjectProperty -InputObject $_ -Name "displayName" } }) {
+foreach ($sp in @(ConvertTo-SafeArray -Value $allServicePrincipals)) {
     $spIndex++
     if (($spIndex % 50) -eq 0) {
-        Write-ScanLog "Service principals verwerkt: $spIndex / $($allServicePrincipals.Count)"
+        Write-ScanLog "Service principals processed: $spIndex / $($allServicePrincipals.Count)"
     }
 
     $spId = Get-ObjectProperty -InputObject $sp -Name "id"
     $spName = Get-ServicePrincipalLabel -ServicePrincipal $sp
 
-    $appRoleAssignments = @(Invoke-GraphGetAllSafe -Uri "/servicePrincipals/$spId/appRoleAssignments?`$select=id,appRoleId,createdDateTime,principalDisplayName,principalId,principalType,resourceDisplayName,resourceId&`$top=999" -Context "Application permissions service principal $spName")
-    $oauth2PermissionGrants = @(Invoke-GraphGetAllSafe -Uri "/servicePrincipals/$spId/oauth2PermissionGrants?`$top=999" -Context "Delegated permissions service principal $spName")
-    $owners = @(Invoke-GraphGetAllSafe -Uri "/servicePrincipals/$spId/owners?`$select=id,displayName,userPrincipalName,mail,appId&`$top=999" -Context "Owners service principal $spName")
+    try {
+        if ([string]::IsNullOrWhiteSpace([string]$spId)) {
+            Add-ScanWarning -Context "Service principals" -Message "Service principal without id skipped: $spName"
+            continue
+        }
 
-    $applicationPermissionLabels = @($appRoleAssignments | ForEach-Object { Resolve-ApplicationPermissionLabel -AppRoleAssignment $_ } | Sort-Object -Unique)
-    $delegatedPermissionLabels = @(Resolve-DelegatedPermissionLabels -Oauth2PermissionGrants $oauth2PermissionGrants | Sort-Object -Unique)
+        $safeSpId = [System.Uri]::EscapeDataString([string]$spId)
+        $appRoleAssignments = @(Invoke-GraphGetAllSafe -Uri "/servicePrincipals/$safeSpId/appRoleAssignments?`$select=id,appRoleId,createdDateTime,principalDisplayName,principalId,principalType,resourceDisplayName,resourceId&`$top=999" -Context "Application permissions service principal $spName")
+        $oauth2PermissionGrants = @(Invoke-GraphGetAllSafe -Uri "/servicePrincipals/$safeSpId/oauth2PermissionGrants?`$top=999" -Context "Delegated permissions service principal $spName")
+        $owners = @(Invoke-GraphGetAllSafe -Uri "/servicePrincipals/$safeSpId/owners?`$select=id,displayName,userPrincipalName,mail,appId&`$top=999" -Context "Owners service principal $spName")
 
-    $directoryRoleLabels = New-Object System.Collections.Generic.List[string]
+        $applicationPermissionLabels = @(Sort-PermissionLabels -PermissionLabels @($appRoleAssignments | ForEach-Object { Resolve-ApplicationPermissionLabel -AppRoleAssignment $_ }))
+        $delegatedPermissionLabels = @(Sort-PermissionLabels -PermissionLabels (Resolve-DelegatedPermissionLabels -Oauth2PermissionGrants $oauth2PermissionGrants))
+
+    $directoryRoleLabels = New-Object System.Collections.ArrayList
     foreach ($assignment in @(Get-RoleAssignmentsForPrincipal -PrincipalId $spId)) {
         $roleDefinitionId = Get-ObjectProperty -InputObject $assignment -Name "roleDefinitionId"
         $scope = Get-ObjectProperty -InputObject $assignment -Name "directoryScopeId"
@@ -1062,8 +1571,8 @@ foreach ($sp in $allServicePrincipals | Sort-Object @{ Expression = { Get-Object
         $directoryRoleLabels.Add("$(Get-RoleName -RoleDefinitionId $roleDefinitionId) (scope: $scope)") | Out-Null
     }
 
-    $userOwnerLabels = New-Object System.Collections.Generic.List[string]
-    $nonUserOwnerLabels = New-Object System.Collections.Generic.List[string]
+    $userOwnerLabels = New-Object System.Collections.ArrayList
+    $nonUserOwnerLabels = New-Object System.Collections.ArrayList
     foreach ($owner in $owners) {
         $type = Get-DirectoryObjectType -Object $owner
         if ($type -eq "user") {
@@ -1073,12 +1582,12 @@ foreach ($sp in $allServicePrincipals | Sort-Object @{ Expression = { Get-Object
             $ownerName = Get-ObjectProperty -InputObject $owner -Name "displayName"
             if ([string]::IsNullOrWhiteSpace($ownerName)) { $ownerName = Get-ObjectProperty -InputObject $owner -Name "appId" }
             if ([string]::IsNullOrWhiteSpace($ownerName)) { $ownerName = Get-ObjectProperty -InputObject $owner -Name "id" }
-            $nonUserOwnerLabels.Add("{0}: {1}" -f $type, $ownerName) | Out-Null
+            [void]$nonUserOwnerLabels.Add(("{0}: {1}" -f $type, $ownerName))
         }
     }
 
     if ($userOwnerLabels.Count -eq 0) {
-        Add-Finding -Severity "High" -Area "Service Principals" -ObjectName $spName -Detail "Geen user-owner gevonden op de service principal."
+        Add-Finding -Severity "High" -Area "Service Principals" -ObjectName $spName -Detail "No user owner found on the service principal."
     }
 
     if ($applicationPermissionLabels.Count -gt 0) {
@@ -1089,20 +1598,27 @@ foreach ($sp in $allServicePrincipals | Sort-Object @{ Expression = { Get-Object
         Add-Finding -Severity "High" -Area "Service Principals" -ObjectName $spName -Detail ("Directory role(s): " + ($directoryRoleLabels -join "; "))
     }
 
-    $servicePrincipalRows.Add([pscustomobject]@{
-        Name = ConvertTo-HtmlEncodedText $spName
-        Type = ConvertTo-HtmlEncodedText (Get-ObjectProperty -InputObject $sp -Name "servicePrincipalType")
-        Enabled = if ((Get-ObjectProperty -InputObject $sp -Name "accountEnabled") -eq $true) { New-Badge -Text "Enabled" -Class "ok" } else { New-Badge -Text "Disabled" -Class "neutral" }
-        ApplicationPermissions = New-HtmlDetailsList -Items $applicationPermissionLabels -SummaryPrefix "application permissions" -EmptyText "Geen application permissions gevonden"
-        DelegatedPermissions = New-HtmlDetailsList -Items $delegatedPermissionLabels -SummaryPrefix "delegated permissions" -EmptyText "Geen delegated permissions gevonden"
-        DirectoryRoles = New-HtmlDetailsList -Items (@($directoryRoleLabels | Sort-Object -Unique)) -SummaryPrefix "directory roles" -EmptyText "Geen directory roles"
-        UserOwners = New-HtmlDetailsList -Items (@($userOwnerLabels | Sort-Object -Unique)) -SummaryPrefix "user owners" -EmptyText "Geen user owners"
-        OtherOwners = New-HtmlDetailsList -Items (@($nonUserOwnerLabels | Sort-Object -Unique)) -SummaryPrefix "andere owners" -EmptyText "Geen andere owners"
-    }) | Out-Null
+        [void]$servicePrincipalRows.Add([pscustomobject]@{
+            Name = ConvertTo-HtmlEncodedText $spName
+            Type = ConvertTo-HtmlEncodedText (Get-ObjectProperty -InputObject $sp -Name "servicePrincipalType")
+            Enabled = if ((Get-ObjectProperty -InputObject $sp -Name "accountEnabled") -eq $true) { New-Badge -Text "Enabled" -Class "ok" } else { New-Badge -Text "Disabled" -Class "neutral" }
+            ApplicationPermissions = New-HtmlDetailsList -Items $applicationPermissionLabels -SummaryPrefix "application permissions" -EmptyText "No application permissions found"
+            DelegatedPermissions = New-HtmlDetailsList -Items $delegatedPermissionLabels -SummaryPrefix "delegated permissions" -EmptyText "No delegated permissions found"
+            DirectoryRoles = New-HtmlDetailsList -Items (@($directoryRoleLabels | Sort-Object -Unique)) -SummaryPrefix "directory roles" -EmptyText "No directory roles"
+            UserOwners = New-HtmlDetailsList -Items (@($userOwnerLabels | Sort-Object -Unique)) -SummaryPrefix "user owners" -EmptyText "No user owners"
+            OtherOwners = New-HtmlDetailsList -Items (@($nonUserOwnerLabels | Sort-Object -Unique)) -SummaryPrefix "other owners" -EmptyText "No other owners"
+        })
+    }
+    catch {
+        $message = Get-ExceptionText -ErrorRecord $_
+        Add-ScanWarning -Context "Service principal $spName" -Message $message
+        Write-ScanLog "Service principal skipped due to error: $spName - $message" "Warn"
+        continue
+    }
 }
 
-Write-ScanLog "Conditional Access policies verwerken..."
-$conditionalAccessRows = New-Object System.Collections.Generic.List[object]
+Write-ScanLog "Processing Conditional Access policies..."
+$conditionalAccessRows = New-Object System.Collections.ArrayList
 foreach ($policy in $allConditionalAccessPolicies | Sort-Object @{ Expression = { Get-ObjectProperty -InputObject $_ -Name "displayName" } }) {
     $policyName = Get-ObjectProperty -InputObject $policy -Name "displayName"
     if ([string]::IsNullOrWhiteSpace($policyName)) {
@@ -1129,7 +1645,7 @@ foreach ($policy in $allConditionalAccessPolicies | Sort-Object @{ Expression = 
     $expandedExcludedUserLabels = @(Get-ConditionalAccessExpandedExcludedUsers -ExcludeUsers $excludeUsers -ExcludeGroups $excludeGroups -ExcludeRoles $excludeRoles -PolicyName $policyName | Sort-Object -Unique)
 
     if ($expandedExcludedUserLabels.Count -gt 0) {
-        Add-Finding -Severity "Medium" -Area "Conditional Access" -ObjectName $policyName -Detail "$($expandedExcludedUserLabels.Count) uitgesloten gebruiker(s), direct of via uitgesloten groep/role."
+        Add-Finding -Severity "Medium" -Area "Conditional Access" -ObjectName $policyName -Detail "$($expandedExcludedUserLabels.Count) excluded user(s), directly or through an excluded group/role."
     }
 
     $state = Get-ObjectProperty -InputObject $policy -Name "state"
@@ -1151,22 +1667,22 @@ foreach ($policy in $allConditionalAccessPolicies | Sort-Object @{ Expression = 
             ($includeUsers | ForEach-Object { "User: $_" })
             (Resolve-GroupIdsToLabels -Ids $includeGroups | ForEach-Object { "Group: $_" })
             (Resolve-RoleIdsToLabels -Ids $includeRoles | ForEach-Object { "Role: $_" })
-        ) -SummaryPrefix "scope items" -EmptyText "Geen include-scope gevonden")
+        ) -SummaryPrefix "scope items" -EmptyText "No include scope found")
         Applications = (New-HtmlDetailsList -Items @(
             ($includeApplicationIds | ForEach-Object { "Include app: $_" })
             ($excludeApplicationIds | ForEach-Object { "Exclude app: $_" })
-        ) -SummaryPrefix "app-regels" -EmptyText "Geen applicatie-regels gevonden")
-        DirectExcludedUsers = New-HtmlDetailsList -Items $directExcludedUserLabels -SummaryPrefix "direct excluded users" -EmptyText "Geen direct excluded users"
-        ExcludedGroups = New-HtmlDetailsList -Items $excludedGroupLabels -SummaryPrefix "excluded groups" -EmptyText "Geen excluded groups"
-        ExcludedRoles = New-HtmlDetailsList -Items $excludedRoleLabels -SummaryPrefix "excluded roles" -EmptyText "Geen excluded roles"
-        ExpandedExcludedUsers = New-HtmlDetailsList -Items $expandedExcludedUserLabels -SummaryPrefix "totaal uitgesloten users" -EmptyText "Geen uitgesloten users gevonden"
-        Configuration = "<details><summary>Configuratie JSON</summary><pre>$rawJson</pre></details>"
+        ) -SummaryPrefix "application rules" -EmptyText "No application rules found")
+        DirectExcludedUsers = New-HtmlDetailsList -Items $directExcludedUserLabels -SummaryPrefix "direct excluded users" -EmptyText "None direct excluded users"
+        ExcludedGroups = New-HtmlDetailsList -Items $excludedGroupLabels -SummaryPrefix "excluded groups" -EmptyText "No excluded groups"
+        ExcludedRoles = New-HtmlDetailsList -Items $excludedRoleLabels -SummaryPrefix "excluded roles" -EmptyText "No excluded roles"
+        ExpandedExcludedUsers = New-HtmlDetailsList -Items $expandedExcludedUserLabels -SummaryPrefix "total excluded users" -EmptyText "No excluded users found"
+        Configuration = "<details><summary>Configuration JSON</summary><pre>$rawJson</pre></details>"
     }) | Out-Null
 }
 
-Write-ScanLog "Rapport opbouwen..."
+Write-ScanLog "Building report..."
 
-$findingsRows = New-Object System.Collections.Generic.List[object]
+$findingsRows = New-Object System.Collections.ArrayList
 foreach ($finding in $script:Findings | Sort-Object @{ Expression = { $_.Severity }; Descending = $true }, Area, ObjectName) {
     $severityClass = switch ($finding.Severity) {
         "High" { "danger" }
@@ -1183,17 +1699,10 @@ foreach ($finding in $script:Findings | Sort-Object @{ Expression = { $_.Severit
     }) | Out-Null
 }
 
-$warningRows = New-Object System.Collections.Generic.List[object]
-foreach ($warning in $script:ScanWarnings) {
-    $warningRows.Add([pscustomobject]@{
-        Context = ConvertTo-HtmlEncodedText $warning.Context
-        Message = ConvertTo-HtmlEncodedText $warning.Message
-    }) | Out-Null
-}
 
 $roleAssignableGroupCount = @($allGroups | Where-Object { (Get-ObjectProperty -InputObject $_ -Name "isAssignableToRole") -eq $true }).Count
 $enabledCaCount = @($allConditionalAccessPolicies | Where-Object { (Get-ObjectProperty -InputObject $_ -Name "state") -eq "enabled" }).Count
-$spWithoutUserOwnerCount = @($script:Findings | Where-Object { $_.Area -eq "Service Principals" -and $_.Detail -like "Geen user-owner*" }).Count
+$spWithoutUserOwnerCount = @($script:Findings | Where-Object { $_.Area -eq "Service Principals" -and $_.Detail -like "No user owner*" }).Count
 $highFindingCount = @($script:Findings | Where-Object { $_.Severity -eq "High" }).Count
 $mediumFindingCount = @($script:Findings | Where-Object { $_.Severity -eq "Medium" }).Count
 
@@ -1205,42 +1714,42 @@ $overviewHtml = @"
 <div class="hero">
     <div>
         <p class="eyebrow">JVEntraIDSecurityAssessment</p>
-        <h1>Microsoft Entra ID Security Rapport</h1>
-        <p class="subtitle">Tenant: <strong>$tenantId</strong> · Account: <strong>$account</strong> · Gegenereerd: <strong>$generatedAt</strong></p>
+        <h1>Microsoft Entra ID Security Report</h1>
+        <p class="subtitle">Tenant: <strong>$tenantId</strong> · Account: <strong>$account</strong> · Generated: <strong>$generatedAt</strong></p>
     </div>
     <div class="hero-chip">Read-only scan</div>
 </div>
 
 <div class="cards">
-    <div class="card"><span>Gebruikers</span><strong>$($allUsers.Count)</strong></div>
+    <div class="card"><span>Users</span><strong>$($allUsers.Count)</strong></div>
     <div class="card"><span>Groups</span><strong>$($allGroups.Count)</strong></div>
     <div class="card"><span>Role-assignable groups</span><strong>$roleAssignableGroupCount</strong></div>
     <div class="card"><span>Service principals</span><strong>$($allServicePrincipals.Count)</strong></div>
     <div class="card"><span>CA policies</span><strong>$($allConditionalAccessPolicies.Count)</strong></div>
     <div class="card"><span>Enabled CA policies</span><strong>$enabledCaCount</strong></div>
-    <div class="card"><span>SPs zonder user-owner</span><strong>$spWithoutUserOwnerCount</strong></div>
+    <div class="card"><span>SPs without user owner</span><strong>$spWithoutUserOwnerCount</strong></div>
     <div class="card"><span>Findings high / medium</span><strong>$highFindingCount / $mediumFindingCount</strong></div>
 </div>
 
 <div class="note">
-    <strong>Scope van deze eerste versie:</strong> actieve role assignments, memberships op scantijdstip, service principal API permissions, owners en Conditional Access configuratie. PIM eligible assignments en audit/sign-in logging zijn bewust nog niet meegenomen.
+    <strong>Scope of this first version:</strong> active role assignments, memberships at scan time, service principal API permissions, owners and Conditional Access configuration. PIM eligible assignments and audit/sign-in logging are intentionally not included yet.
 </div>
 "@
 
-$findingsTable = New-DataTableHtml -Id "findingsTable" -Title "Aandachtspunten" -Rows ($findingsRows.ToArray()) -Columns @("Severity", "Area", "ObjectName", "Detail") -ColumnLabels @{
+$findingsTable = New-DataTableHtml -Id "findingsTable" -Title "Findings" -Rows ($findingsRows.ToArray()) -Columns @("Severity", "Area", "ObjectName", "Detail") -ColumnLabels @{
     Severity = "Severity"
-    Area = "Onderdeel"
+    Area = "Area"
     ObjectName = "Object"
     Detail = "Detail"
 }
 
-$userTable = New-DataTableHtml -Id "usersTable" -Title "Gebruikers" -Rows ($userRows.ToArray()) -Columns @("Name", "Enabled", "UserType", "DirectoryRoles", "OwnedObjects", "Groups") -ColumnLabels @{
-    Name = "Gebruiker"
+$userTable = New-DataTableHtml -Id "usersTable" -Title "Users" -Rows ($userRows.ToArray()) -Columns @("Name", "Enabled", "UserType", "DirectoryRoles", "OwnedObjects", "Groups") -ColumnLabels @{
+    Name = "User"
     Enabled = "Status"
     UserType = "Type"
     DirectoryRoles = "Directory Roles"
     OwnedObjects = "Owned objects"
-    Groups = "Groepen"
+    Groups = "Groups"
 }
 
 $groupTable = New-DataTableHtml -Id "groupsTable" -Title "Groups" -Rows ($groupRows.ToArray()) -Columns @("Name", "RoleAssignable", "SecurityEnabled", "MailEnabled", "GroupTypes", "DirectoryRoles") -ColumnLabels @{
@@ -1260,25 +1769,21 @@ $servicePrincipalTable = New-DataTableHtml -Id "servicePrincipalsTable" -Title "
     DelegatedPermissions = "API delegated permissions"
     DirectoryRoles = "Directory roles"
     UserOwners = "User owners"
-    OtherOwners = "Andere owners"
+    OtherOwners = "Other owners"
 }
 
 $conditionalAccessTable = New-DataTableHtml -Id "conditionalAccessTable" -Title "Conditional Access Policies" -Rows ($conditionalAccessRows.ToArray()) -Columns @("Name", "State", "IncludeScope", "Applications", "DirectExcludedUsers", "ExcludedGroups", "ExcludedRoles", "ExpandedExcludedUsers", "Configuration") -ColumnLabels @{
     Name = "Policy"
     State = "State"
     IncludeScope = "Include scope"
-    Applications = "Applicaties"
+    Applications = "Applications"
     DirectExcludedUsers = "Direct excluded users"
     ExcludedGroups = "Excluded groups"
     ExcludedRoles = "Excluded roles"
-    ExpandedExcludedUsers = "Uitgesloten users totaal"
-    Configuration = "Configuratie"
+    ExpandedExcludedUsers = "Total excluded users"
+    Configuration = "Configuration"
 }
 
-$warningsTable = New-DataTableHtml -Id "warningsTable" -Title "Scan warnings" -Rows ($warningRows.ToArray()) -Columns @("Context", "Message") -ColumnLabels @{
-    Context = "Context"
-    Message = "Melding"
-}
 
 $css = @"
 :root {
@@ -1549,6 +2054,14 @@ pre {
     font-size: 12px;
 }
 
+.footer a {
+    color: var(--accent-strong);
+    font-weight: 800;
+    text-decoration: none;
+}
+
+.footer a:hover { text-decoration: underline; }
+
 @media (max-width: 1000px) {
     .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .hero, .table-card-header { flex-direction: column; align-items: stretch; }
@@ -1590,7 +2103,7 @@ window.addEventListener('DOMContentLoaded', function() {
 
 $html = @"
 <!doctype html>
-<html lang="nl">
+<html lang="en">
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -1601,23 +2114,21 @@ $html = @"
     <main class="container">
         $overviewHtml
 
-        <nav class="tabs" aria-label="Rapport tabs">
-            <button class="tab-button" data-tab="tab-findings" onclick="showTab('tab-findings')">Aandachtspunten</button>
-            <button class="tab-button" data-tab="tab-users" onclick="showTab('tab-users')">Gebruikers</button>
+        <nav class="tabs" aria-label="Report tabs">
+            <button class="tab-button" data-tab="tab-users" onclick="showTab('tab-users')">Users</button>
             <button class="tab-button" data-tab="tab-groups" onclick="showTab('tab-groups')">Groups</button>
             <button class="tab-button" data-tab="tab-service-principals" onclick="showTab('tab-service-principals')">Service Principals</button>
             <button class="tab-button" data-tab="tab-conditional-access" onclick="showTab('tab-conditional-access')">Conditional Access Policies</button>
-            <button class="tab-button" data-tab="tab-warnings" onclick="showTab('tab-warnings')">Scan warnings</button>
+            <button class="tab-button" data-tab="tab-findings" onclick="showTab('tab-findings')">Findings</button>
         </nav>
 
-        <section id="tab-findings" class="tab-panel">$findingsTable</section>
         <section id="tab-users" class="tab-panel">$userTable</section>
         <section id="tab-groups" class="tab-panel">$groupTable</section>
         <section id="tab-service-principals" class="tab-panel">$servicePrincipalTable</section>
         <section id="tab-conditional-access" class="tab-panel">$conditionalAccessTable</section>
-        <section id="tab-warnings" class="tab-panel">$warningsTable</section>
+        <section id="tab-findings" class="tab-panel">$findingsTable</section>
 
-        <p class="footer">Generated by JVEntraIDSecurityAssessment.ps1 · Accent $AccentColor</p>
+        <p class="footer">Generated by <a href="https://github.com/JustinVerstijnen/JV-EntraIDSecurityAssessment" target="_blank" rel="noopener noreferrer">JVEntraIDSecurityAssessment</a> · Accent $AccentColor</p>
     </main>
     <script>$javascript</script>
 </body>
@@ -1630,13 +2141,13 @@ if (-not [string]::IsNullOrWhiteSpace($outputDirectory) -and -not (Test-Path -Pa
 }
 
 $html | Out-File -FilePath $OutputPath -Encoding UTF8 -Force
-Write-ScanLog "Rapport geschreven naar: $OutputPath" "Done"
+Write-ScanLog "Report written to: $OutputPath" "Done"
 
 if ($OpenReport) {
     try {
         Invoke-Item -Path $OutputPath
     }
     catch {
-        Write-ScanLog "Rapport kon niet automatisch geopend worden: $($_.Exception.Message)" "Warn"
+        Write-ScanLog "Report could not be opened automatically: $($_.Exception.Message)" "Warn"
     }
 }
